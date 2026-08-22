@@ -1,0 +1,95 @@
+{
+  "name": "dsh-plugin-model-proxy",
+  "version": "0.1.0",
+  "description": "DSH plugin: per-model proxy routing (http/https/socks5) with a settings UI — e.g. opencode/muse-spark-1.2-contributor needs a proxy while sibling models stay direct",
+  "type": "module",
+  "keywords": [
+    "dsh-plugin"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "main": "lib/host/index.js",
+  "types": "lib/host/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/host/index.d.ts",
+      "default": "./lib/host/index.js"
+    },
+    "./client": {
+      "types": "./lib/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./invariant": {
+      "types": "./lib/invariant.d.ts",
+      "default": "./lib/invariant.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "npm run build:host && npm run build:client",
+    "build:host": "tsc -p tsconfig.host.json",
+    "build:client": "tsc -p tsconfig.client.json && node scripts/build-client.mjs",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test \"tests/*.test.mjs\"",
+    "typecheck": "tsc --noEmit -p tsconfig.host.json && tsc --noEmit -p tsconfig.client.json",
+    "clean": "rm -rf lib",
+    "prepublishOnly": "npm run test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "undici": "^6.19.0"
+  },
+  "optionalDependencies": {
+    "socks": "^2.8.3"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.6",
+    "@deepseek-ai/schemastery": ">=3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": false
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": false
+    },
+    "@deepseek-ai/dsh-settings": {
+      "optional": false
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-settings": "0.1.0-rc.8",
+    "@types/node": "^22.20.1",
+    "@types/react": "^19.2.18",
+    "esbuild": "^0.28.2",
+    "react": "^19.2.8",
+    "typescript": "^6.0.3"
+  }
+}

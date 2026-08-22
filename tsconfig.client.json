@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": ["ES2024", "DOM"],
+    "outDir": "lib/client",
+    "rootDir": "src/client",
+    "emitDeclarationOnly": true
+  },
+  "include": ["src/client/**/*", "src/shims.d.ts"],
+  "references": []
+}

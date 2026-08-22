@@ -1,0 +1,13 @@
+# dependencies & build
+node_modules/
+lib/
+.test-build/
+.pnpm-store/
+
+# legacy local proxy artifacts
+__pycache__/
+*.pyc
+
+# editor / OS noise
+.DS_Store
+*.log

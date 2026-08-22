@@ -1,0 +1,15 @@
+# dsh-plugin-model-proxy — bundle layer
+#
+# Declared by package.json#dsh.bundle.patch and applied automatically by
+# `dsh plugin --profile <name> add dsh-plugin-model-proxy`. Manual installs can
+# copy these rows into ~/.dsh/cordis.patch.yml or a --patch overlay.
+#
+# Only the HOST row is a loader entry (the specifier field is `name:`). The
+# browser half is discovered automatically from package.json#dsh.client and
+# served at /plugins/dsh-plugin-model-proxy/client.js — never add a second
+# `model-proxy/client` loader row, it would run browser code in the host.
+
+- insert:
+    - id: model-proxy/host
+      name: dsh-plugin-model-proxy
+      config: {}

@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "jsx": "preserve",
+    "lib": ["ES2024", "DOM"],
+    "outDir": "lib",
+    "rootDir": "src"
+  },
+  "include": ["src/host/**/*", "src/invariant.ts", "src/shims.d.ts"]
+}
