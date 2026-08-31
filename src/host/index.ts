@@ -12,7 +12,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { ModelProxyConfig, assertServiceable, resolveProxy, redactProxyUrl, type ModelProxyConfig as ConfigType, type ProxyRule } from './config.js'
 import { als, installFetchWrapper, shouldWrapFetch } from './fetch-wrap.js'
@@ -23,7 +23,7 @@ import { probeProxy } from './probe.js'
 export const name = 'dsh-plugin-model-proxy'
 export const inject = ['settings', 'llm']
 
-const NS = settingsNamespace('model-proxy')
+const NS = 'model-proxy' as const
 
 export function apply(ctx: Context, entry: ConfigType): void {
   // Normalize entry through schema defaults so bare {} works
@@ -210,25 +210,39 @@ export function apply(ctx: Context, entry: ConfigType): void {
   // 1) Settings namespace — live, validated, layered over entry.
   // Registered AFTER the wrapper/disposer effects above so a synchronous
   // first onChange cannot touch a not-yet-initialized binding.
-  installSettingsSection(ctx, NS, ModelProxyConfig as unknown as Parameters<typeof installSettingsSection>[2], entry as unknown, {
-    validate(value: unknown) {
-      assertServiceable(value as ConfigType)
-    },
-    setSource(next: () => ConfigType) {
-      current = next as () => ConfigType
-    },
-    onChange() {
-      syncFetchWrapper()
-      reconcileConfigSideEffects()
-      const cfg = current()
-      if (!cfg.debug) return
-      const summary = cfg.rules
-        .map((r) => `${r.provider}/${r.model}→${r.proxyUrl ? redactProxyUrl(r.proxyUrl) : 'direct'}${r.purpose ? `@${r.purpose}` : ''}`)
-        .join(', ')
-      ctx.logger.info(
-        `[model-proxy] config applied: enabled=${cfg.enabled} rules=${cfg.rules.length}${summary ? ` [${summary}]` : ''} defaultProxy=${cfg.defaultProxy ? redactProxyUrl(cfg.defaultProxy) : 'direct'}`,
-      )
-    },
+  // Uses ctx.inject(['settings']) for dsh-settings >= 0.1.2
+  const installSettings = (settingsService: SettingsProvider): void => {
+    settingsService.installSection(
+      ctx,
+      NS,
+      ModelProxyConfig as unknown as Parameters<typeof settingsService.installSection>[2],
+      entry as unknown,
+      {
+        validate(value: unknown) {
+          assertServiceable(value as ConfigType)
+        },
+        setSource(next: () => ConfigType) {
+          current = next as () => ConfigType
+        },
+        onChange() {
+          syncFetchWrapper()
+          reconcileConfigSideEffects()
+          const cfg = current()
+          if (!cfg.debug) return
+          const summary = cfg.rules
+            .map((r) => `${r.provider}/${r.model}→${r.proxyUrl ? redactProxyUrl(r.proxyUrl) : 'direct'}${r.purpose ? `@${r.purpose}` : ''}`)
+            .join(', ')
+          ctx.logger.info(
+            `[model-proxy] config applied: enabled=${cfg.enabled} rules=${cfg.rules.length}${summary ? ` [${summary}]` : ''} defaultProxy=${cfg.defaultProxy ? redactProxyUrl(cfg.defaultProxy) : 'direct'}`,
+          )
+        },
+      }
+    )
+  }
+
+  // Use ctx.inject to get the settings service when available
+  ctx.inject(['settings'], (settingsCtx: { settings: SettingsProvider }) => {
+    installSettings(settingsCtx.settings)
   })
 
   // Kick initial reconciliation (entry-level config, credential cache warmup,
