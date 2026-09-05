@@ -5,7 +5,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { attachConfigured, getPath, pickModelsByProvider, pickProviders, ProviderCatalogStore, unwrapRpc } from '../.test-build/catalog.js'
+import { attachConfigured, getPath, joinProviderDirectory, pickModelsByProvider, pickProviders, ProviderCatalogStore, unwrapRemoteResult, unwrapRpc } from '../.test-build/catalog.js'
 
 const okEnvelope = (value) => ({ result: { ok: true, value } })
 const errEnvelope = (message) => ({ result: { ok: false, error: { message } } })
@@ -304,4 +304,238 @@ test('describe failure or missing face degrades to configured-undefined rows', a
   assert.deepEqual(faceless.calls, ['providers', 'models'], 'must not attempt describe without a face')
   assert.equal(s2.getSnapshot().providers[0].configured, undefined)
   s2.dispose()
+})
+
+/** Typert RemoteResult envelope helpers (DSH 0.1.2 remote face). */
+const remoteOk = (value) => ({ ok: true, value })
+const remoteErr = (message) => ({ ok: false, error: { message } })
+
+/** Fake ctx.remote with Typert llm/settings faces resolving RemoteResults. */
+function fakeTypertRemote({ registered, directory, registeredError, registeredReject, directoryError, directoryReject, omitDirectoryFace, describe, sessionCatalog, sessionCatalogReject }) {
+  const listeners = new Map()
+  const calls = []
+  const on = (event, listener) => {
+    if (!listeners.has(event)) listeners.set(event, new Set())
+    listeners.get(event).add(listener)
+    return () => listeners.get(event).delete(listener)
+  }
+  const remote = {
+    $on: on,
+    llm: {
+      async listProviders() {
+        calls.push('typert:listProviders')
+        if (registeredReject) throw new Error(registeredReject)
+        if (registeredError) return remoteErr(registeredError)
+        return remoteOk(registered ?? [])
+      },
+    },
+    settings: describe === undefined
+      ? undefined
+      : {
+          async describe() {
+            calls.push('typert:describe')
+            return describe
+          },
+        },
+  }
+  if (!omitDirectoryFace) {
+    remote.llm.listConfigurableProviders = async () => {
+      calls.push('typert:listConfigurableProviders')
+      if (directoryReject) throw new Error(directoryReject)
+      if (directoryError) return remoteErr(directoryError)
+      return remoteOk(directory ?? [])
+    }
+  }
+  if (sessionCatalog !== undefined || sessionCatalogReject !== undefined) {
+    remote.session = {
+      async modelCatalog() {
+        calls.push('typert:modelCatalog')
+        if (sessionCatalogReject) throw new Error(sessionCatalogReject)
+        return sessionCatalog
+      },
+    }
+  }
+  return {
+    calls,
+    remote,
+    emit(event) {
+      for (const listener of listeners.get(event) ?? []) listener()
+    },
+  }
+}
+
+test('unwrapRemoteResult unwraps Typert envelopes and passes payloads through', () => {
+  assert.deepEqual(unwrapRemoteResult(remoteOk([{ id: 'a' }])), [{ id: 'a' }])
+  assert.deepEqual(unwrapRemoteResult([{ id: 'a' }]), [{ id: 'a' }])
+  assert.deepEqual(unwrapRemoteResult({ providers: [] }), { providers: [] })
+  assert.throws(() => unwrapRemoteResult(remoteErr('boom')), /boom/)
+  assert.throws(() => unwrapRemoteResult({ ok: false, error: {} }), /remote request failed/)
+})
+
+test('joinProviderDirectory mirrors the Models page: declared first, live-only appended', () => {
+  const joined = joinProviderDirectory(
+    [{ id: 'mine', name: 'Mine Live' }, { id: 'live-only', name: 'Live Only' }],
+    [
+      { provider: 'mine', displayName: 'Mine', settingsNs: 'ns', settingsPath: ['providers', 'mine'], declared: false },
+      { provider: 'dormant', displayName: 'Dormant', settingsNs: 'ns', settingsPath: [] },
+    ],
+  )
+  const rows = pickProviders(joined)
+  assert.deepEqual(rows, [
+    {
+      provider: 'mine',
+      displayName: 'Mine',
+      active: true,
+      settingsNs: 'ns',
+      settingsPath: ['providers', 'mine'],
+      declared: false,
+    },
+    { provider: 'dormant', displayName: 'Dormant', active: false, settingsNs: 'ns', settingsPath: [] },
+    { provider: 'live-only', displayName: 'Live Only', active: true },
+  ])
+  assert.deepEqual(pickProviders(joinProviderDirectory([], [])), [])
+})
+
+test('store prefers the Typert face and joins live routes with the directory', async () => {
+  // Regression: the Typert path used to feed the {ok,value} envelope straight
+  // into pickProviders, yielding [] and a silent input-only fallback.
+  const backend = fakeBackend({ models: { groups: [], failures: [] } })
+  backend.api.llm.providers = async () => {
+    backend.calls.push('legacy:providers')
+    return okEnvelope({ providers: [] })
+  }
+  const ty = fakeTypertRemote({
+    registered: [{ id: 'mine', name: 'Mine Live' }, { id: 'live-only', name: 'Live Only' }],
+    directory: [
+      { provider: 'mine', displayName: 'Mine', settingsNs: 'ns', settingsPath: ['providers', 'mine'] },
+      { provider: 'dormant', displayName: 'Dormant', settingsNs: 'ns', settingsPath: [] },
+    ],
+    describe: remoteOk({
+      namespaces: [
+        { ns: 'ns', value: { providers: { mine: {}, dormant: {} } } },
+        { ns: 'other', value: { providers: [{ provider: 'synth', models: ['sm1', { id: 'sm2', name: 'S2' }] }] } },
+      ],
+    }),
+  })
+  const store = await settledStore(backend, ty.remote)
+  const snap = store.getSnapshot()
+  assert.equal(snap.status, 'ready')
+  assert.ok(!backend.calls.includes('legacy:providers'), 'Typert face must win over legacy providers')
+  assert.deepEqual(snap.providers.map((p) => [p.provider, p.active, p.configured]), [
+    ['mine', true, true],
+    ['dormant', false, true],
+    ['live-only', true, undefined],
+  ])
+  // models synthesized from the settings.describe mirror (no bulk llm.models on 0.1.2)
+  assert.deepEqual(snap.modelsByProvider.synth, [{ id: 'sm1' }, { id: 'sm2', name: 'S2' }])
+  store.dispose()
+})
+
+test('Typert business rejection on both faces marks unavailable, legacy untouched', async () => {
+  const backend = fakeBackend({ models: { groups: [], failures: [] } })
+  const ty = fakeTypertRemote({ registeredError: 'llm down', directoryError: 'llm down' })
+  const store = await settledStore(backend, ty.remote)
+  assert.equal(store.getSnapshot().status, 'unavailable')
+  assert.deepEqual(store.getSnapshot().providers, [])
+  assert.ok(!backend.calls.includes('providers'), 'must not fall back to legacy once Typert answered')
+  store.dispose()
+})
+
+test('one surviving Typert side still yields a dropdown', async () => {
+  const backend = fakeBackend({ models: { groups: [], failures: [] } })
+  const ty = fakeTypertRemote({
+    registeredReject: 'carrier fault',
+    directory: [{ provider: 'dir-only', displayName: 'Dir Only', settingsNs: 'ns', settingsPath: [] }],
+  })
+  const store = await settledStore(backend, ty.remote)
+  assert.equal(store.getSnapshot().status, 'ready')
+  assert.deepEqual(store.getSnapshot().providers, [
+    { provider: 'dir-only', displayName: 'Dir Only', active: false, settingsNs: 'ns', settingsPath: [] },
+  ])
+  store.dispose()
+})
+
+test('hosts returning bare arrays keep working (no-envelope passthrough)', async () => {
+  const backend = fakeBackend({ models: { groups: [], failures: [] } })
+  const events = fakeTypertRemote({ registered: [], directory: [] })
+  events.remote.llm.listProviders = async () => {
+    events.calls.push('typert:listProviders')
+    return [{ id: 'bare', name: 'Bare' }]
+  }
+  const store = await settledStore(backend, events.remote)
+  assert.equal(store.getSnapshot().status, 'ready')
+  assert.deepEqual(store.getSnapshot().providers.map((p) => p.provider), ['bare'])
+  store.dispose()
+})
+
+test('session.modelCatalog feeds models when legacy bulk models are gone', async () => {
+  // Modern hosts removed the bulk llm.models RPC; the Plugins-tab-native
+  // session catalog carries the same {groups} shape.
+  const backend = fakeBackend({
+    providers: { providers: [{ provider: 'p1', displayName: 'p1', active: true }] },
+    models: { groups: [], failures: [] },
+  })
+  delete backend.api.llm.models
+  const ty = fakeTypertRemote({
+    registered: [{ id: 'p1', name: 'P One' }],
+    directory: [],
+    sessionCatalog: remoteOk({
+      default: { provider: 'p1', model: 'm1' },
+      routableProviders: ['p1'],
+      groups: [{ id: 'p1', name: 'P One', models: [{ id: 'm1', name: 'M One' }, { id: 'm2' }] }],
+    }),
+  })
+  const store = await settledStore(backend, ty.remote)
+  const snap = store.getSnapshot()
+  assert.equal(snap.status, 'ready')
+  assert.deepEqual(snap.modelsByProvider, { p1: [{ id: 'm1', name: 'M One' }, { id: 'm2' }] })
+  assert.ok(ty.calls.includes('typert:modelCatalog'))
+  store.dispose()
+})
+
+test('legacy bulk models still win when both faces answer', async () => {
+  const backend = fakeBackend({
+    providers: { providers: [{ provider: 'p1', displayName: 'p1', active: true }] },
+    models: { groups: [{ id: 'p1', name: 'p1', models: [{ id: 'legacy-m' }] }], failures: [] },
+  })
+  const ty = fakeTypertRemote({
+    sessionCatalog: remoteOk({ groups: [{ id: 'p1', name: 'p1', models: [{ id: 'session-m' }] }] }),
+  })
+  const store = await settledStore(backend, ty.remote)
+  assert.deepEqual(store.getSnapshot().modelsByProvider, { p1: [{ id: 'legacy-m' }] })
+  assert.ok(!ty.calls.includes('typert:modelCatalog'), 'must not call session catalog while legacy answers')
+  store.dispose()
+})
+
+test('session catalog failure degrades to empty models without failing providers', async () => {
+  const backend = fakeBackend({
+    providers: { providers: [{ provider: 'p1', displayName: 'p1', active: true }] },
+    models: { groups: [], failures: [] },
+  })
+  delete backend.api.llm.models
+  const ty = fakeTypertRemote({
+    registered: [{ id: 'p1', name: 'P One' }],
+    directory: [],
+    sessionCatalog: remoteErr('session down'),
+  })
+  const store = await settledStore(backend, ty.remote)
+  assert.equal(store.getSnapshot().status, 'ready')
+  assert.deepEqual(store.getSnapshot().providers.map((p) => p.provider), ['p1'])
+  assert.deepEqual(store.getSnapshot().modelsByProvider, {})
+  store.dispose()
+})
+
+test('first-load provider failure warns about the text-input fallback', async () => {
+  const warnings = []
+  const orig = console.warn
+  console.warn = (...args) => warnings.push(args.join(' '))
+  try {
+    const backend = fakeBackend({ providers: {}, providersError: 'rpc unavailable' })
+    const store = await settledStore(backend)
+    assert.equal(store.getSnapshot().status, 'unavailable')
+    assert.ok(warnings.some((m) => m.includes('free-text inputs')), `expected fallback warning, got ${JSON.stringify(warnings)}`)
+    store.dispose()
+  } finally {
+    console.warn = orig
+  }
 })

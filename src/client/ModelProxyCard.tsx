@@ -1,10 +1,115 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import type { CSSProperties } from 'react'
-import type { CatalogSnapshot } from './catalog.js'
-import { ProviderCatalogStore } from './catalog.js'
+import type { CatalogSnapshot, DirectoryMirror } from './catalog.js'
+import { ProviderCatalogStore, mirrorModelsToMap } from './catalog.js'
 import type { ModelProxyController, ModelProxyConfig, ProxyRule } from './controller.js'
 import { buildCreatorRules, ensureRuleIds, groupByProvider, makeRuleId } from './controller.js'
 import { en } from './locales.js'
+
+// ---------------------------------------------------------------------------
+// Design-system alignment for DSH 0.1.2-alpha.3
+// ---------------------------------------------------------------------------
+// DSH switched from ad-hoc #ccc/#ddd borders to the DSW alias tokens
+// (var(--dsw-alias-border-l2) etc). Native <select>/<input> without the
+// token classes now looks "失效" — wrong background/border in dark mode and
+// missing custom dropdown arrow. Mirror the token-based styling used by
+// ui-settings-models (Be6O7G_input / Be6O7G_selectInput) and
+// ui-settings-plugins (fields.module.css) so the card feels native.
+//
+// We inject a single <style> tag keyed by plugin id, like DSH's own
+// css modules do (query by data-plugin-css to stay idempotent across HMR).
+const MP_CSS = `
+.mp_input,.mp_select{
+  box-sizing:border-box;
+  border:1px solid var(--dsw-alias-border-l2);
+  background:var(--dsw-alias-bg-layer-3);
+  color:var(--dsw-alias-label-primary);
+  border-radius:8px;
+  height:32px;
+  font:inherit;
+  font-size:13px;
+  line-height:1.5;
+  padding:0 10px;
+  width:100%;
+}
+.mp_select{
+  appearance:none;
+  cursor:pointer;
+  padding-right:32px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%2381858C' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-position:right 10px center;
+  background-repeat:no-repeat;
+  background-size:12px 12px;
+}
+.mp_input:focus,.mp_select:focus{
+  border-color:var(--dsw-alias-brand-primary);
+  outline:none;
+}
+.mp_input:disabled,.mp_select:disabled{
+  opacity:.6;
+  cursor:default;
+}
+.mp_input::placeholder{
+  color:var(--dsw-alias-label-dimmed);
+}
+.mp_inputInvalid{
+  border-color:var(--dsw-alias-label-error) !important;
+}
+.mp_btnSecondary{
+  box-sizing:border-box;
+  height:28px;
+  padding:0 10px;
+  border-radius:8px;
+  border:1px solid var(--dsw-alias-border-l2);
+  background:var(--dsw-alias-bg-layer-3);
+  color:var(--dsw-alias-label-primary);
+  font:inherit;
+  font-size:12px;
+  line-height:1.5;
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:4px;
+}
+.mp_btnSecondary:hover:not(:disabled){
+  background:var(--dsw-alias-interactive-bg-hover);
+  border-color:var(--dsw-alias-label-dimmed);
+}
+.mp_btnSecondary:disabled{opacity:.4;cursor:default;}
+.mp_btnSecondary:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px;}
+.mp_btnPrimary{
+  box-sizing:border-box;
+  height:32px;
+  padding:0 14px;
+  border-radius:8px;
+  border:1px solid transparent;
+  background:var(--dsw-alias-label-primary);
+  color:var(--dsw-alias-bg-layer-3);
+  font:inherit;
+  font-size:13px;
+  line-height:1.5;
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+}
+.mp_btnPrimary:disabled{opacity:.4;cursor:default;}
+.mp_btnPrimary:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px;}
+.mp_card{border:1px solid var(--dsw-alias-border-l2);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px;background:var(--dsw-alias-bg-layer-3);}
+.mp_ruleCard{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px;display:grid;grid-template-columns:1fr 1fr;gap:8px;background:var(--dsw-alias-bg-layer-3);}
+.mp_ruleCardDisabled{background:var(--dsw-alias-bg-module-platform);}
+.mp_ruleCardInvalid{border-color:var(--dsw-alias-label-error);}
+.mp_creator{border:1px solid var(--dsw-alias-border-l2);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px;background:var(--dsw-alias-bg-module-platform);}
+`
+const MP_CSS_TAG_ID = 'dsh-plugin-model-proxy/card.css'
+if (typeof document !== 'undefined' && document.querySelector(`style[data-plugin-css="${MP_CSS_TAG_ID}"]`) === null) {
+  const tag = document.createElement('style')
+  tag.dataset.plugin = 'dsh-plugin-model-proxy'
+  tag.dataset.pluginCss = MP_CSS_TAG_ID
+  tag.textContent = MP_CSS
+  document.head.appendChild(tag)
+}
 
 type Props = {
   controller: ModelProxyController
@@ -47,6 +152,10 @@ function CatalogField(props: {
   const [customMode, setCustomMode] = useState(() => value !== '' && !groups.some((g) => g.options.some((o) => o.value === value)))
   const flat = groups.flatMap((g) => g.options)
   const showSelect = flat.length > 0 && !customMode
+  // 目录异步到达后，若已有值在选项中则自动退回下拉，避免首帧空 groups 导致已存规则一直停留在输入框
+  useEffect(() => {
+    if (customMode && flat.some((o) => o.value === value)) setCustomMode(false)
+  }, [flat, value, customMode])
 
   if (flat.length === 0) {
     return (
@@ -54,7 +163,8 @@ function CatalogField(props: {
         value={value}
         placeholder={inputPlaceholder}
         onChange={(e) => onChange(e.target.value)}
-        style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid #ccc', width: '100%', boxSizing: 'border-box' }}
+        className="mp_input"
+        style={{ width: '100%' }}
         disabled={disabled}
       />
     )
@@ -72,7 +182,8 @@ function CatalogField(props: {
             }
             onChange(e.target.value)
           }}
-          style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid #ccc', flex: 1, minWidth: 0 }}
+          className="mp_select"
+          style={{ flex: 1, minWidth: 0 }}
           disabled={disabled}
         >
           {!flat.some((o) => o.value === value) && <option value="">{chooseLabel}</option>}
@@ -95,7 +206,8 @@ function CatalogField(props: {
             value={value}
             placeholder={inputPlaceholder}
             onChange={(e) => onChange(e.target.value)}
-            style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid #ccc', flex: 1, minWidth: 0 }}
+            className="mp_input"
+            style={{ flex: 1, minWidth: 0 }}
             disabled={disabled}
           />
           <button
@@ -103,14 +215,8 @@ function CatalogField(props: {
             title={listTitle}
             onClick={() => setCustomMode(false)}
             disabled={disabled}
-            style={{
-              padding: '4px 8px',
-              borderRadius: 6,
-              border: '1px solid #ddd',
-              background: '#fff',
-              cursor: 'pointer',
-              lineHeight: 1,
-            }}
+            className="mp_btnSecondary"
+            style={{ width: 32, padding: 0, flex: 'none' }}
           >
             ▾
           </button>
@@ -210,7 +316,7 @@ function GroupHeader(props: {
 
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
-      <span style={{ fontWeight: 700 }}>
+      <span style={{ fontWeight: 700, color: 'var(--dsw-alias-label-primary)' }}>
         {displayName === provider ? provider : `${displayName} · ${provider}`}
         <span style={{ fontWeight: 400, opacity: 0.6, marginLeft: 6 }}>{count}</span>
       </span>
@@ -222,14 +328,15 @@ function GroupHeader(props: {
         onKeyDown={(e) => {
           if (e.key === 'Enter') onApplyProxy(proxy.trim())
         }}
-        style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #ddd', width: 200 }}
+        className="mp_input"
+        style={{ width: 200 }}
         disabled={disabled}
       />
       <button type="button" onClick={() => onApplyProxy(proxy.trim())} disabled={disabled || proxy.trim() === ''}
-        style={smallButtonStyle}>
+        className="mp_btnSecondary">
         {t('groupApply')}
       </button>
-      <button type="button" onClick={() => onSetEnabled(!allEnabled)} disabled={disabled} style={smallButtonStyle}>
+      <button type="button" onClick={() => onSetEnabled(!allEnabled)} disabled={disabled} className="mp_btnSecondary">
         {allEnabled ? t('groupDisableAll') : t('groupEnableAll')}
       </button>
       <button
@@ -243,10 +350,10 @@ function GroupHeader(props: {
           }
         }}
         disabled={disabled}
+        className="mp_btnSecondary"
         style={{
-          ...smallButtonStyle,
-          borderColor: confirming ? '#d66' : '#ddd',
-          color: confirming ? '#d66' : undefined,
+          borderColor: confirming ? 'var(--dsw-alias-state-error-primary)' : undefined,
+          color: confirming ? 'var(--dsw-alias-state-error-primary)' : undefined,
         }}
       >
         {confirming ? t('groupConfirmDelete') : t('groupDelete')}
@@ -278,15 +385,23 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
   )
 
   const cfg: ModelProxyConfig = useMemo(() => {
-    return ensureRuleIds(
-      snap.value ?? {
-        enabled: true,
-        rules: [],
-        defaultProxy: '',
-        debug: false,
-      },
-    )
+    // The host-computed directory mirror rides the same snapshot but is NOT
+    // editable state: strip it before ensureRuleIds/draft/dirty/save so
+    // mirror refreshes never fake a local edit or ride a save.
+    const raw = snap.value ?? {
+      enabled: true,
+      rules: [],
+      defaultProxy: '',
+      debug: false,
+    }
+    const { catalog: _mirror, ...editable } = raw
+    return ensureRuleIds(editable)
   }, [snap.value])
+
+  // Directory mirror fallback for pages without the cross-namespace Typert
+  // remotes. Remote rows always win; mirror rows only fill gaps.
+  const mirror = snap.value?.catalog
+  const mirrorModelMap = useMemo(() => mirrorModelsToMap(mirror), [mirror])
 
   const [draft, setDraft] = useState<ModelProxyConfig>(cfg)
   const [saving, setSaving] = useState(false)
@@ -320,25 +435,39 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
   // into two groups — user-configured first, bare directory second — so the
   // common case is one click away without hiding pre-provisioning targets.
   const providerGroups: FieldGroup[] = useMemo(() => {
-    const opts: FieldOption[] = cat.providers.map((p) => ({
-      value: p.provider,
-      label: p.displayName === p.provider ? p.provider : `${p.displayName} (${p.provider})${p.active ? '' : ` · ${t('dormant')}`}`,
-    }))
-    if (!cat.providers.some((p) => p.configured !== undefined)) return [{ options: opts }]
-    const configured: FieldOption[] = []
-    const directory: FieldOption[] = []
-    for (let i = 0; i < cat.providers.length; i++) {
-      const p = cat.providers[i]!
-      ;(p.configured === true ? configured : directory).push(opts[i]!)
+    if (cat.providers.length > 0) {
+      const opts: FieldOption[] = cat.providers.map((p) => ({
+        value: p.provider,
+        label: p.displayName === p.provider ? p.provider : `${p.displayName} (${p.provider})${p.active ? '' : ` · ${t('dormant')}`}`,
+      }))
+      if (!cat.providers.some((p) => p.configured !== undefined)) return [{ options: opts }]
+      const configured: FieldOption[] = []
+      const directory: FieldOption[] = []
+      for (let i = 0; i < cat.providers.length; i++) {
+        const p = cat.providers[i]!
+        ;(p.configured === true ? configured : directory).push(opts[i]!)
+      }
+      return [
+        ...(configured.length > 0 ? [{ label: t('groupConfigured'), options: configured }] : []),
+        ...(directory.length > 0 ? [{ label: t('groupDirectory'), options: directory }] : []),
+      ]
     }
-    return [
-      ...(configured.length > 0 ? [{ label: t('groupConfigured'), options: configured }] : []),
-      ...(directory.length > 0 ? [{ label: t('groupDirectory'), options: directory }] : []),
-    ]
-  }, [cat, t])
+    // Mirror fallback: flat list, no configured grouping (the mirror carries
+    // no settings addresses). Dormant rows stay selectable with a suffix.
+    const mirrorOpts: FieldOption[] = (mirror?.providers ?? [])
+      .filter((p) => typeof p.provider === 'string' && p.provider !== '')
+      .map((p) => {
+        const base = p.displayName !== undefined && p.displayName !== '' && p.displayName !== p.provider
+          ? `${p.displayName} (${p.provider})`
+          : p.provider
+        return { value: p.provider, label: p.active === false ? `${base} · ${t('dormant')}` : base }
+      })
+    return [{ options: mirrorOpts }]
+  }, [cat, t, mirror])
   const modelOptionsFor = useCallback(
     (provider: string): FieldOption[] => {
-      const models = cat.modelsByProvider[provider] ?? []
+      const remote = cat.modelsByProvider[provider] ?? []
+      const models = remote.length > 0 ? remote : (mirrorModelMap[provider] ?? [])
       if (models.length === 0) return []
       const wildcard: FieldOption = { value: '*', label: `* (${t('wildcardAll')})` }
       return [
@@ -346,10 +475,16 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
         ...models.map((m) => ({ value: m.id, label: m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id })),
       ]
     },
-    [cat, t],
+    [cat, t, mirrorModelMap],
   )
+  const mirrorProviderCount = (mirror?.providers ?? []).filter((p) => typeof p?.provider === 'string' && p.provider !== '').length
   const catalogMissing =
-    catalog !== undefined && cat.status === 'unavailable' && cat.providers.length === 0
+    catalog !== undefined && cat.status === 'unavailable' && cat.providers.length === 0 && mirrorProviderCount === 0
+  // Providers loaded but no model rows anywhere: every Model field is a text
+  // box by design, so say so instead of looking like a broken dropdown.
+  const modelsMissing =
+    catalog !== undefined && cat.status === 'ready' && cat.providers.length + mirrorProviderCount > 0 &&
+    Object.keys(cat.modelsByProvider).length === 0 && Object.keys(mirrorModelMap).length === 0
 
   const onSave = useCallback(async () => {
     // local validation before write — mirror the host's assertServiceable so
@@ -459,50 +594,51 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
     setDraft((d) => ({ ...d, rules: d.rules.filter((r) => r.id !== id) }))
   }, [])
 
-  if (snap.status === 'loading') return <div style={{ padding: 12, opacity: 0.7 }}>{t('reading')}</div>
-  if (snap.status === 'unavailable') return <div style={{ padding: 12 }}>{t('unavailable')}</div>
+  if (snap.status === 'loading') return <div style={{ padding: 12, opacity: 0.7, color: 'var(--dsw-alias-label-primary)' }}>{t('reading')}</div>
+  if (snap.status === 'unavailable') return <div style={{ padding: 12, color: 'var(--dsw-alias-label-primary)' }}>{t('unavailable')}</div>
 
   return (
-    <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
+    <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 12, color: 'var(--dsw-alias-label-primary)' }}>
       <div>
-        <div style={{ fontWeight: 700, fontSize: 16 }}>{t('title')}</div>
-        <div style={{ opacity: 0.7, fontSize: 12, marginTop: 4 }}>{t('desc')}</div>
-        {!snap.writable && <div style={{ color: '#a66', fontSize: 12, marginTop: 6 }}>{t('readOnly')}</div>}
-        {catalogMissing && <div style={{ opacity: 0.6, fontSize: 12, marginTop: 6 }}>{t('catalogUnavailable')}</div>}
+        <div style={{ fontWeight: 700, fontSize: 16, color: 'var(--dsw-alias-label-primary)' }}>{t('title')}</div>
+        <div style={{ opacity: 0.7, fontSize: 12, marginTop: 4, color: 'var(--dsw-alias-label-tertiary)' }}>{t('desc')}</div>
+        {!snap.writable && <div style={{ color: 'var(--dsw-alias-state-warn-label)', fontSize: 12, marginTop: 6 }}>{t('readOnly')}</div>}
+        {catalogMissing && <div style={{ opacity: 0.6, fontSize: 12, marginTop: 6, color: 'var(--dsw-alias-label-tertiary)' }}>{t('catalogUnavailable')}</div>}
+        {modelsMissing && <div style={{ opacity: 0.6, fontSize: 12, marginTop: 6, color: 'var(--dsw-alias-label-tertiary)' }}>{t('modelsUnavailable')}</div>}
       </div>
 
-      <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+      <label style={{ display: 'flex', gap: 8, alignItems: 'center', color: 'var(--dsw-alias-label-primary)' }}>
         <input type="checkbox" checked={draft.enabled} onChange={(e) => setField({ enabled: e.target.checked })} disabled={!snap.writable} />
         <span>{t('enabled')}</span>
       </label>
 
-      <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+      <label style={{ display: 'flex', gap: 8, alignItems: 'center', color: 'var(--dsw-alias-label-primary)' }}>
         <input type="checkbox" checked={draft.debug} onChange={(e) => setField({ debug: e.target.checked })} disabled={!snap.writable} />
         <span>{t('debug')}</span>
       </label>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div style={{ fontWeight: 600 }}>{t('rules')}</div>
+        <div style={{ fontWeight: 600, color: 'var(--dsw-alias-label-primary)' }}>{t('rules')}</div>
         <button
           onClick={() => {
             setCreatorOpen((o) => !o)
             setCreatorError(undefined)
           }}
           disabled={!snap.writable}
-          style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid #ccc', background: '#fff', cursor: 'pointer' }}
+          className="mp_btnSecondary"
         >
           ＋ {t('addRule')}
         </button>
       </div>
 
-      {draft.rules.length === 0 && !creatorOpen && <div style={{ opacity: 0.6, fontSize: 12 }}>{t('empty')}</div>}
+      {draft.rules.length === 0 && !creatorOpen && <div style={{ opacity: 0.6, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }}>{t('empty')}</div>}
 
       {creatorOpen && (
-        <div style={{ border: '1px solid #bbb', borderRadius: 10, padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <div style={{ fontWeight: 600 }}>{t('creatorTitle')}</div>
+        <div className="mp_creator">
+          <div style={{ fontWeight: 600, color: 'var(--dsw-alias-label-primary)' }}>{t('creatorTitle')}</div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
             <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <span style={{ fontSize: 11, opacity: 0.7 }}>{t('provider')}</span>
+              <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('provider')}</span>
               <CatalogField
                 value={creator.provider}
                 groups={providerGroups}
@@ -515,28 +651,53 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
               />
             </label>
             <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <span style={{ fontSize: 11, opacity: 0.7 }}>{t('proxyUrl')}</span>
+              <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('proxyUrl')}</span>
               <input
                 value={creator.proxyUrl}
                 placeholder={t('proxyPlaceholder')}
                 onChange={(e) => setCreatorField({ proxyUrl: e.target.value })}
-                style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid #ccc' }}
+                className="mp_input"
                 disabled={!snap.writable}
               />
             </label>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <span style={{ fontSize: 11, opacity: 0.7 }}>{t('creatorModels')}</span>
+            <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('creatorModels')}</span>
             {modelOptionsFor(creator.provider).length === 0 ? (
-              <span style={{ opacity: 0.6, fontSize: 12 }}>{t('noneCatalogued')}</span>
+              <>
+                <span style={{ opacity: 0.6, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }}>{t('noneCatalogued')}</span>
+                {(() => {
+                  // No catalog rows (e.g. remote faces unreachable and no
+                  // profile declares models): still offer the bare `*`
+                  // wildcard as a one-click checkbox, so "check models" stays
+                  // true and `vendor-*` patterns keep the input below.
+                  const starExists = ruleExists(creator.provider, '*')
+                  const starChecked = creator.checked.includes('*')
+                  return (
+                    <label style={{ display: 'flex', gap: 6, alignItems: 'center', opacity: starExists ? 0.45 : 1, color: 'var(--dsw-alias-label-primary)' }}>
+                      <input
+                        type="checkbox"
+                        checked={starChecked}
+                        disabled={!snap.writable || starExists}
+                        onChange={() =>
+                          setCreatorField({
+                            checked: starChecked ? creator.checked.filter((m) => m !== '*') : [...creator.checked, '*'],
+                          })
+                        }
+                      />
+                      <span style={{ fontSize: 12 }}>* ({t('wildcardAll')}){starExists ? ` · ${t('alreadyRuled')}` : ''}</span>
+                    </label>
+                  )
+                })()}
+              </>
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
                 {modelOptionsFor(creator.provider).map((o) => {
                   const exists = ruleExists(creator.provider, o.value)
                   const checked = creator.checked.includes(o.value)
                   return (
-                    <label key={o.value} style={{ display: 'flex', gap: 6, alignItems: 'center', opacity: exists ? 0.45 : 1 }}>
+                    <label key={o.value} style={{ display: 'flex', gap: 6, alignItems: 'center', opacity: exists ? 0.45 : 1, color: 'var(--dsw-alias-label-primary)' }}>
                       <input
                         type="checkbox"
                         checked={checked}
@@ -557,56 +718,51 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
               value={creator.customPattern}
               placeholder={t('creatorPatternHint')}
               onChange={(e) => setCreatorField({ customPattern: e.target.value })}
-              style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid #ccc' }}
+              className="mp_input"
               disabled={!snap.writable}
             />
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
             <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <span style={{ fontSize: 11, opacity: 0.7 }}>{t('purpose')}</span>
+              <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('purpose')}</span>
               <input
                 value={creator.purpose}
                 placeholder={t('purposePlaceholder')}
                 onChange={(e) => setCreatorField({ purpose: e.target.value })}
-                style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid #ccc' }}
+                className="mp_input"
                 disabled={!snap.writable}
               />
             </label>
             <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <span style={{ fontSize: 11, opacity: 0.7 }}>{t('credRef')}</span>
+              <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('credRef')}</span>
               <input
                 value={creator.credentialRef}
                 placeholder={t('credRefPlaceholder')}
                 onChange={(e) => setCreatorField({ credentialRef: e.target.value })}
-                style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid #ccc' }}
+                className="mp_input"
                 disabled={!snap.writable}
               />
             </label>
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, alignItems: 'center' }}>
-            {creatorError && <span style={{ color: '#b33', fontSize: 11 }}>{creatorError}</span>}
+            {creatorError && <span style={{ color: 'var(--dsw-alias-state-error-primary)', fontSize: 11 }}>{creatorError}</span>}
             <button
               onClick={() => {
                 setCreatorOpen(false)
                 setCreator(EMPTY_CREATOR)
                 setCreatorError(undefined)
               }}
-              style={smallButtonStyle}
+              className="mp_btnSecondary"
             >
               {t('cancel')}
             </button>
             <button
               onClick={createRules}
               disabled={!snap.writable || creator.provider.trim() === '' || creatorModelCount === 0}
-              style={{
-                ...smallButtonStyle,
-                borderColor: '#222',
-                background: creatorModelCount > 0 ? '#222' : '#999',
-                color: '#fff',
-                cursor: creatorModelCount > 0 ? 'pointer' : 'not-allowed',
-              }}
+              className="mp_btnPrimary"
+              style={{ opacity: (!snap.writable || creator.provider.trim() === '' || creatorModelCount === 0) ? 0.4 : 1 }}
             >
               {t('createN').replace('{n}', String(creatorModelCount))}
             </button>
@@ -621,7 +777,7 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
           ? `${entry.displayName}`
           : group.provider
         return (
-          <div key={group.provider} style={{ border: '1px solid #e8e8e8', borderRadius: 10, padding: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div key={group.provider} className="mp_card">
             <GroupHeader
               provider={group.provider}
               displayName={displayName}
@@ -641,18 +797,10 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
                 return (
                   <div
                     key={r.id}
-                    style={{
-                      border: `1px solid ${err ? '#d66' : '#ddd'}`,
-                      borderRadius: 8,
-                      padding: 8,
-                      display: 'grid',
-                      gridTemplateColumns: '1fr 1fr',
-                      gap: 8,
-                      background: r.enabled ? '#fff' : '#f7f7f7',
-                    }}
+                    className={`mp_ruleCard ${err ? 'mp_ruleCardInvalid' : ''} ${!r.enabled ? 'mp_ruleCardDisabled' : ''}`}
                   >
                     <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <span style={{ fontSize: 11, opacity: 0.7 }}>{t('model')}</span>
+                      <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('model')}</span>
                       <CatalogField
                         value={r.model}
                         groups={[{ options: modelOptionsFor(r.provider) }]}
@@ -665,37 +813,37 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
                       />
                     </label>
                     <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <span style={{ fontSize: 11, opacity: 0.7 }}>{t('proxyUrl')}</span>
+                      <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('proxyUrl')}</span>
                       <input
                         value={r.proxyUrl}
                         placeholder={t('proxyPlaceholder')}
                         onChange={(e) => updateRule(r.id, { proxyUrl: e.target.value })}
-                        style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid #ccc' }}
+                        className={`mp_input ${err ? 'mp_inputInvalid' : ''}`}
                         disabled={!snap.writable}
                       />
-                      {err && <span style={{ color: '#b33', fontSize: 11 }}>{err === 'duplicate' ? t('duplicate') : err}</span>}
+                      {err && <span style={{ color: 'var(--dsw-alias-state-error-primary)', fontSize: 11 }}>{err === 'duplicate' ? t('duplicate') : err}</span>}
                     </label>
                     <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <span style={{ fontSize: 11, opacity: 0.7 }}>{t('purpose')}</span>
+                      <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('purpose')}</span>
                       <input
                         value={r.purpose ?? ''}
                         placeholder={t('purposePlaceholder')}
                         onChange={(e) => updateRule(r.id, { purpose: e.target.value })}
-                        style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid #ccc' }}
+                        className="mp_input"
                         disabled={!snap.writable}
                       />
                     </label>
                     <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <span style={{ fontSize: 11, opacity: 0.7 }}>{t('credRef')}</span>
+                      <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('credRef')}</span>
                       <input
                         value={r.credentialRef ?? ''}
                         placeholder={t('credRefPlaceholder')}
                         onChange={(e) => updateRule(r.id, { credentialRef: e.target.value })}
-                        style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid #ccc' }}
+                        className="mp_input"
                         disabled={!snap.writable}
                       />
                     </label>
-                    <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <label style={{ display: 'flex', gap: 8, alignItems: 'center', color: 'var(--dsw-alias-label-primary)' }}>
                       <input type="checkbox" checked={r.enabled} onChange={(e) => updateRule(r.id, { enabled: e.target.checked })} disabled={!snap.writable} />
                       <span style={{ fontSize: 12 }}>{t('enabledShort')}</span>
                     </label>
@@ -703,7 +851,7 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
                       <button
                         onClick={() => removeRule(r.id)}
                         disabled={!snap.writable}
-                        style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #ddd', background: '#fff', cursor: 'pointer' }}
+                        className="mp_btnSecondary"
                       >
                         {t('delete')}
                       </button>
@@ -717,33 +865,27 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
       })}
 
       <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <span style={{ fontSize: 12, fontWeight: 600 }}>{t('defaultProxy')}</span>
+        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' }}>{t('defaultProxy')}</span>
         <input
           value={draft.defaultProxy}
           placeholder={t('defaultPlaceholder')}
           onChange={(e) => setField({ defaultProxy: e.target.value })}
-          style={{ padding: '6px 8px', borderRadius: 6, border: `1px solid ${defaultProxyError ? '#d66' : '#ccc'}` }}
+          className={`mp_input ${defaultProxyError ? 'mp_inputInvalid' : ''}`}
           disabled={!snap.writable}
         />
-        {defaultProxyError && <span style={{ color: '#b33', fontSize: 11 }}>{defaultProxyError}</span>}
+        {defaultProxyError && <span style={{ color: 'var(--dsw-alias-state-error-primary)', fontSize: 11 }}>{defaultProxyError}</span>}
       </label>
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
         <button
           onClick={onSave}
           disabled={!snap.writable || !dirty || saving}
-          style={{
-            padding: '8px 14px',
-            borderRadius: 8,
-            border: '1px solid #222',
-            background: dirty ? '#222' : '#999',
-            color: '#fff',
-            cursor: dirty ? 'pointer' : 'not-allowed',
-          }}
+          className="mp_btnPrimary"
+          style={{ opacity: (!snap.writable || !dirty || saving) ? 0.4 : 1 }}
         >
           {saving ? t('saving') : t('save')}
         </button>
-        {msg && <span style={{ fontSize: 12, opacity: 0.8 }}>{msg}</span>}
+        {msg && <span style={{ fontSize: 12, opacity: 0.8, color: 'var(--dsw-alias-label-primary)' }}>{msg}</span>}
       </div>
     </div>
   )

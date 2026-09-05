@@ -5,6 +5,7 @@
  */
 
 import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
+import type { DirectoryMirror } from './catalog.js'
 
 export type ProxyRule = {
   /** Card key; may be absent on hand-written yaml rules until edited here. */
@@ -24,6 +25,13 @@ export type ModelProxyConfig = {
   rules: ProxyRule[]
   defaultProxy: string
   debug: boolean
+  /**
+   * Host-computed directory mirror. The card reads it for dropdown options
+   * but never writes it: save() only touches the four editable fields, and
+   * the card strips it from drafts/dirty checks so mirror refreshes never
+   * fake a local edit.
+   */
+  catalog?: DirectoryMirror
 }
 
 export type ModelProxySnapshot = {

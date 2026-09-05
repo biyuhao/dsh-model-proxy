@@ -8,6 +8,7 @@ import {
   getOrCreateDispatcher,
   clearDispatcherCache,
   socksDependencyAvailable,
+  PROXY_POOL_DEFAULTS,
 } from '../lib/host/dispatcher.js'
 
 test('socks dependency probe reports availability without throwing', () => {
@@ -55,4 +56,17 @@ test('unsupported scheme throws with a redacted message', () => {
 
 test('unparseable proxyUrl throws with truncated echo', () => {
   assert.throws(() => getOrCreateDispatcher('not a url ::::'), /invalid proxyUrl/)
+})
+
+test('pooled dispatchers raise keep-alive and concurrency above undici stock defaults', () => {
+  // undici stock: keepAliveTimeout 4s, connections 10/origin. LLM bursts are
+  // sparse, so the stock idle timeout leaves the pool cold every time.
+  assert.ok(
+    PROXY_POOL_DEFAULTS.keepAliveTimeout >= 30_000,
+    `keepAliveTimeout must hold idle sockets across chat turns, got ${PROXY_POOL_DEFAULTS.keepAliveTimeout}`,
+  )
+  assert.ok(
+    PROXY_POOL_DEFAULTS.connections >= 20,
+    `connections must absorb parallel streaming fans, got ${PROXY_POOL_DEFAULTS.connections}`,
+  )
 })

@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-model-proxy",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH plugin: per-model proxy routing (http/https/socks5) with a settings UI — e.g. opencode/muse-spark-1.2-contributor needs a proxy while sibling models stay direct",
   "type": "module",
   "keywords": [

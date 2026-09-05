@@ -344,7 +344,7 @@ function getOrCreateDispatcher(proxyUrl: string) {
 ```
 
 * **为什么不能直接用 `SocksProxyAgent`**：`socks-proxy-agent` 导出的是 Node 的 `http.Agent`，而 undici `fetch` 的 `dispatcher` 选项要求 undici `Dispatcher` 接口。把 `SocksProxyAgent` 传进去会报 `agent.dispatch is not a function` → 表现为 `Connection error`。因此 socks 用 undici `Agent` + 自定义 `connect` 自建：`connect` 经 socks 隧道连到目标，https 目标再把 raw socket 用 `tls.connect` 包一层后交回。
-* **连接池与复用**：`ProxyAgent` / `Agent` 自带连接池，按 `proxyUrl` 缓存即可。
+* **连接池与复用**：`ProxyAgent` / `Agent` 自带连接池，按 `proxyUrl` 缓存即可；池参数相对 undici 默认调高（`PROXY_POOL_DEFAULTS`：`keepAliveTimeout 30s`、`connections 20`/`origin`），`pipelining` 保持默认 1（SSE 不 pipeline）。
 * **认证**：URL 中的 `user:pass` 自动生效；也支持后续扩展 `proxyCredentialRef` 另存，运行时拼到 URL。
 * **`socks5` vs `socks5h`**：两者在同一实现下都将目标 hostname 交给代理解析（等效 `socks5h` 语义，规避本地 DNS 污染）；插件透传即可。
 

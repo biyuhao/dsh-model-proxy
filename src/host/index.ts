@@ -15,6 +15,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { ModelProxyConfig, assertServiceable, resolveProxy, redactProxyUrl, type ModelProxyConfig as ConfigType, type ProxyRule } from './config.js'
+import { catalogsEqual, computeDirectoryCatalog } from './directory.js'
 import { als, installFetchWrapper, shouldWrapFetch } from './fetch-wrap.js'
 import { clearDispatcherCache, socksDependencyAvailable } from './dispatcher.js'
 import { composeProxyUrl, getCredentialsService, type CredentialLookup } from './credentials.js'
@@ -241,8 +242,51 @@ export function apply(ctx: Context, entry: ConfigType): void {
   }
 
   // Use ctx.inject to get the settings service when available
+  // 2) Directory mirror — host-computed provider/model catalog persisted into
+  // our own namespace so cards on pages without the cross-namespace Typert
+  // remotes (`remote.llm` / `remote.session` / `remote.settings`, e.g.
+  // non-loopback pages) still render dropdowns via their own settings scope.
+  //
+  // Loop safety: bursts collapse into one trailing write through mirrorChain,
+  // and the deep-equal guard means an unchanged recompute never touches the
+  // document. Our own write re-triggers `settings/document-updated`, but the
+  // recompute then equals the mirror and skips — no write loop. The client
+  // never writes `catalog`. Only ids/display names are mirrored, never
+  // credentials or secrets (computeDirectoryCatalog extracts names only).
+  let settingsSvc: SettingsProvider | undefined
+  let mirrorChain: Promise<void> = Promise.resolve()
+  const refreshDirectoryMirror = (): void => {
+    mirrorChain = mirrorChain.then(async () => {
+      if (!settingsSvc) return
+      const face = settingsSvc as unknown as {
+        describe?: () => Array<{ ns?: unknown; value?: unknown }>
+        update?: (ns: string, patch: Record<string, unknown>) => Promise<unknown>
+      }
+      if (typeof face.describe !== 'function' || typeof face.update !== 'function') return
+      let namespaces: Array<{ ns?: unknown; value?: unknown }> = []
+      try {
+        const described = face.describe()
+        if (Array.isArray(described)) namespaces = described
+      } catch { /* keep empty: next trigger recomputes */ }
+      let llmFace: { listProviders?(): unknown; listConfigurableProviders?(): unknown } | undefined
+      try {
+        llmFace = (ctx as unknown as { llm?: { listProviders?(): unknown; listConfigurableProviders?(): unknown } }).llm
+      } catch { llmFace = undefined }
+      const next = computeDirectoryCatalog(llmFace, namespaces)
+      if (catalogsEqual(current().catalog, next)) return
+      try {
+        await face.update(NS, { catalog: next })
+      } catch (err) {
+        ctx.logger.warn(`[model-proxy] directory mirror write failed: ${String(err)}`)
+      }
+    }).catch(() => {})
+  }
+  ctx.on('llm/adapters-updated', () => refreshDirectoryMirror())
+  ctx.on('settings/document-updated', () => refreshDirectoryMirror())
   ctx.inject(['settings'], (settingsCtx: { settings: SettingsProvider }) => {
+    settingsSvc = settingsCtx.settings
     installSettings(settingsCtx.settings)
+    refreshDirectoryMirror()
   })
 
   // Kick initial reconciliation (entry-level config, credential cache warmup,

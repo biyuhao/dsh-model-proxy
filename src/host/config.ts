@@ -41,11 +41,64 @@ export interface ProxyRule {
   credentialRef?: string
 }
 
+/**
+ * Host-computed provider/model directory mirrored into this namespace so
+ * settings surfaces that cannot reach the cross-namespace Typert remotes
+ * (`remote.llm` / `remote.session` / `remote.settings` — e.g. non-loopback
+ * pages) still render dropdowns. Read through the card's own settings scope,
+ * which is available wherever the card itself renders.
+ *
+ * COMPUTED, NEVER EDIT: the host rewrites it on `llm/adapters-updated` and
+ * `settings/document-updated` (deep-equal guarded, so no write loop); the
+ * client never writes it and strips it from drafts/dirty checks. Only ids
+ * and display names are mirrored — never credentials or secrets.
+ */
+export interface DirectoryModel {
+  id: string
+  name?: string
+}
+
+export interface DirectoryProvider {
+  provider: string
+  displayName?: string
+  /** Live route membership; unknown/absent renders as dormant, never hidden. */
+  active?: boolean
+}
+
+export interface DirectoryCatalog {
+  providers: DirectoryProvider[]
+  models: Array<{ provider: string; models: DirectoryModel[] }>
+}
+
+export const DirectoryModelSchema: any = z.object({
+  id: z.string().required(),
+  name: z.string(),
+})
+
+export const DirectoryProviderSchema: any = z.object({
+  provider: z.string().required(),
+  displayName: z.string(),
+  active: z.boolean(),
+})
+
+export const DirectoryCatalogSchema: any = z.object({
+  providers: z.array(DirectoryProviderSchema).default([]),
+  models: z.array(z.object({
+    provider: z.string().required(),
+    models: z.array(DirectoryModelSchema).default([]),
+  })).default([]),
+})
+
 export const ModelProxyConfigSchema: any = z.object({
   enabled: z.boolean().default(true),
   rules: z.array(ProxyRuleSchema).default([]),
   defaultProxy: z.string().default(''),
   debug: z.boolean().default(false),
+  // No .default() on `catalog` itself; the nested field defaults still
+  // materialize an empty mirror ({providers: [], models: []}) on bare
+  // documents. The card treats an empty mirror exactly like an absent one,
+  // and the host overwrites it on the first mirror pass.
+  catalog: DirectoryCatalogSchema,
 })
 
 export interface ModelProxyConfig {
@@ -53,6 +106,8 @@ export interface ModelProxyConfig {
   rules: ProxyRule[]
   defaultProxy: string
   debug: boolean
+  /** Host-computed directory mirror; absent until the first mirror pass. */
+  catalog?: DirectoryCatalog
 }
 export const ModelProxyConfig: any = ModelProxyConfigSchema
 

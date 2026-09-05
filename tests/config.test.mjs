@@ -16,7 +16,7 @@ test('schema resolves hand-written yaml rules without id (no function-default tr
 
 test('schema materializes defaults for bare entry', () => {
   const cfg = ModelProxyConfig({})
-  assert.deepEqual(cfg, { enabled: true, rules: [], defaultProxy: '', debug: false })
+  assert.deepEqual(cfg, { enabled: true, rules: [], defaultProxy: '', debug: false, catalog: { providers: [], models: [] } })
 })
 
 test('rejects whitespace-padded provider / model', () => {
@@ -140,4 +140,24 @@ test('redactProxyUrl hides password but keeps shape', () => {
   assert.ok(out.includes('***'))
   assert.ok(!out.includes('secretpw'))
   assert.ok(out.startsWith('socks5://user:'))
+})
+
+test('catalog mirror field is optional, validates, and never affects routing', () => {
+  // Bare documents materialize an empty mirror (nested defaults); the card
+  // treats an empty mirror exactly like an absent one.
+  const bare = ModelProxyConfig({})
+  assert.deepEqual(bare.catalog, { providers: [], models: [] })
+  // A host-written mirror round-trips through the schema.
+  const mirror = {
+    providers: [
+      { provider: 'mine', displayName: 'Mine', active: true },
+      { provider: 'dormant', active: false },
+    ],
+    models: [{ provider: 'mine', models: [{ id: 'm1', name: 'M One' }, { id: 'm2' }] }],
+  }
+  const cfg = ModelProxyConfig({ ...baseConfig(), catalog: mirror })
+  assert.deepEqual(cfg.catalog, mirror)
+  // Validation and routing ignore the mirror entirely.
+  assert.doesNotThrow(() => assertServiceable({ ...baseConfig(), catalog: mirror }))
+  assert.equal(resolveProxy({ ...baseConfig(), catalog: mirror }, 'mine', 'm1'), undefined)
 })

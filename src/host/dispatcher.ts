@@ -22,6 +22,24 @@ const cache = new Map<string, unknown>()
 /** IANA-assigned default port for SOCKS when the proxy URL omits one. */
 const DEFAULT_SOCKS_PORT = 1080
 
+/**
+ * Raised pool defaults for proxied LLM traffic, applied to both the native
+ * `ProxyAgent` and the bespoke socks `Agent` below.
+ *
+ * undici ships `keepAliveTimeout: 4s` / `connections: 10` per origin. LLM
+ * calls arrive in sparse bursts (chat turns minutes apart, subagents fanning
+ * out), so the stock 4s idle timeout leaves the pool cold almost every time
+ * and the first token of each burst pays a full socks-CONNECT + TLS
+ * handshake through the proxy. 30s idle retention keeps the previous turn's
+ * sockets warm for the next one at the cost of a few idle fds; 20
+ * connections per origin absorbs parallel streaming fans without queueing.
+ * `pipelining` stays at undici's default 1 — SSE streams must not pipeline.
+ */
+export const PROXY_POOL_DEFAULTS = {
+  keepAliveTimeout: 30_000,
+  connections: 20,
+}
+
 // The `connect` option undici passes to Agent is a buildConnector-like fn:
 //   connect(opts: { host, hostname, protocol, port, servername }, cb)
 // undici gives `port` as '' for default scheme ports, so we fill it in.
@@ -121,7 +139,7 @@ function createSocksDispatcher(proxyUrl: string): unknown {
       .catch((err: Error) => callback(err))
   }
 
-  return new Agent({ connect: connectThroughSocks as never })
+  return new Agent({ ...PROXY_POOL_DEFAULTS, connect: connectThroughSocks as never })
 }
 
 /** A proxy URL may be reused by many rules; cache one Dispatcher per URL. */
@@ -140,7 +158,7 @@ export function getOrCreateDispatcher(proxyUrl: string): unknown {
 
   let d: unknown
   if (u.protocol === 'http:' || u.protocol === 'https:') {
-    d = new ProxyAgent(proxyUrl)
+    d = new ProxyAgent({ uri: proxyUrl, ...PROXY_POOL_DEFAULTS })
   } else if (u.protocol === 'socks5:' || u.protocol === 'socks5h:' || u.protocol === 'socks:') {
     d = createSocksDispatcher(proxyUrl)
   } else {

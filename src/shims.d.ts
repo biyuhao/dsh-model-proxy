@@ -39,7 +39,7 @@ declare module '@deepseek-ai/schemastery' {
 }
 declare module 'undici' {
   export class ProxyAgent {
-    constructor(url: string)
+    constructor(url: string | { uri: string; keepAliveTimeout?: number; connections?: number | null })
   }
   export class Agent {
     constructor(opts?: { connect?: unknown })

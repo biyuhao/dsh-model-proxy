@@ -121,6 +121,13 @@ test('buildCreatorRules returns empty for missing provider or models', () => {
   assert.deepEqual(buildCreatorRules({ provider: 'p', models: [], proxyUrl: '' }), [])
 })
 
+test('buildCreatorRules keeps checked models and wildcard patterns side by side', () => {
+  // Creator contract: checkbox picks (exact ids, incl. bare `*`) merge with
+  // the custom pattern input (`vendor-*`) into one batch.
+  const rules = buildCreatorRules({ provider: 'p', models: ['m1', '*', 'muse-*'], proxyUrl: '' })
+  assert.deepEqual(rules.map((r) => r.model), ['m1', '*', 'muse-*'])
+})
+
 test('makeRuleId yields non-empty distinct strings', () => {
   assert.notEqual(makeRuleId(), makeRuleId())
   assert.ok(makeRuleId().length > 0)
