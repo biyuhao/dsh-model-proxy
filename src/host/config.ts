@@ -140,8 +140,16 @@ export function assertServiceable(config: ModelProxyConfig): void {
     if (r.purpose !== undefined && r.purpose !== '' && r.purpose !== r.purpose.trim()) {
       throw new Error(`model-proxy: rule #${i + 1} purpose has leading/trailing whitespace: ${JSON.stringify(r.purpose)}`)
     }
-    if (r.credentialRef !== undefined && r.credentialRef !== '' && r.credentialRef !== r.credentialRef.trim()) {
-      throw new Error(`model-proxy: rule #${i + 1} credentialRef has leading/trailing whitespace: ${JSON.stringify(r.credentialRef)}`)
+    if (r.credentialRef !== undefined && r.credentialRef !== '') {
+      if (r.credentialRef !== r.credentialRef.trim()) {
+        throw new Error(`model-proxy: rule #${i + 1} credentialRef has leading/trailing whitespace: ${JSON.stringify(r.credentialRef)}`)
+      }
+      if (/\s/.test(r.credentialRef)) {
+        throw new Error(`model-proxy: rule #${i + 1} credentialRef must not contain whitespace: ${JSON.stringify(r.credentialRef)}`)
+      }
+      if (r.credentialRef.includes('://')) {
+        throw new Error(`model-proxy: rule #${i + 1} credentialRef is an entry name, not a URL: ${JSON.stringify(r.credentialRef)}`)
+      }
     }
     const key = `${r.provider}\0${r.model}`
     if (!r.provider.trim()) throw new Error(`model-proxy: rule #${i + 1} provider must be non-empty`)
