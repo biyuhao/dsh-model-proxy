@@ -14,6 +14,7 @@
 
 import { ProxyAgent, Agent } from 'undici'
 import { createRequire } from 'node:module'
+import net from 'node:net'
 import tls from 'node:tls'
 import { redactProxyUrl } from './config.js'
 
@@ -117,12 +118,13 @@ function createSocksDispatcher(proxyUrl: string): unknown {
 
     const finishRaw = (raw: import('net').Socket) => {
       if (opts.protocol === 'https:' || port === 443) {
-        const secure = tls.connect({
-          socket: raw,
-          servername: opts.servername ?? host,
-          host,
-          port,
-        })
+        // RFC 6066 forbids an IP address as the TLS SNI ServerName; Node emits
+        // DEP0123 when one is set. Only forward a servername when it is a real
+        // hostname — for IP targets SNI is omitted, which is the correct behavior.
+        const servername = opts.servername ?? host
+        const tlsOpts: tls.ConnectionOptions = { socket: raw, host, port }
+        if (servername && !net.isIP(servername)) tlsOpts.servername = servername
+        const secure = tls.connect(tlsOpts)
         secure.once('secureConnect', () => callback(null, secure))
         secure.once('error', (err) => callback(err))
       } else {
