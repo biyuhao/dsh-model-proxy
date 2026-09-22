@@ -31,10 +31,11 @@ clean: ## 清理 lib
 
 # 1) 本地代码替换 dsh 中已安装的插件
 #    原理：dsh plugin --profile <name> add file:<path> 把本目录写成该 profile 的 file: 依赖。
-#    pnpm（hoisted nodeLinker）把源码文件硬链接进 profile/node_modules（isolated 则是符号链接），
-#    node_modules 就是当前源码的实时视图——spec 已是 file: 时 pnpm 短路也不影响内容同步；
+#    pnpm 把源码文件导入 profile/node_modules（旧版本为硬链接；pnpm v12 + APFS 下为
+#    clone/拷贝，inode 不同；isolated linker 则是符号链接），改动后需重新 make sync 刷新
+#    ——spec 已是 file: 时 pnpm 短路也不影响内容同步；
 #    sync 真正要做的是：重新构建、把 spec 收敛为 file:（覆盖旧 registry 版本）、
-#    校验 bundles 层与链接身份，防止"装了但没被加载 / 加载的是旧拷贝"。
+#    校验 bundles 层与内容一致性，防止"装了但没被加载 / 加载的是旧拷贝"。
 sync: build ## 构建后用本地 file: 覆盖到 dsh profile（默认 PROFILE=web）
 	@echo "==> sync $(PKG_DIR) -> dsh profile [$(PROFILE)] ($(PNPM_DIR))"
 	@test -f "$(PKG_DIR)/package.json" || (echo "package.json not found in $(PKG_DIR)"; exit 1)
@@ -55,11 +56,12 @@ sync: build ## 构建后用本地 file: 覆盖到 dsh profile（默认 PROFILE=w
 	else \
 		echo "  ! spec 未指向当前目录，请检查 pnpm add 结果"; \
 	fi
-	# 机制级校验 2：node_modules 产物与源码同 inode（硬链接）或经符号链接指向源码，而不是旧拷贝
-	@if [ -f "$(PNPM_DIR)/node_modules/dsh-plugin-model-proxy/lib/client.js" ] && [ "$$(stat -f %i '$(PKG_DIR)/lib/client.js')" = "$$(stat -f %i '$(PNPM_DIR)/node_modules/dsh-plugin-model-proxy/lib/client.js')" ]; then \
-		echo "  ✓ 已与当前源码建立链接（同 inode）"; \
+	# 机制级校验 2：node_modules 产物内容必须与当前构建一致（硬链接/clone/拷贝均可；
+	# pnpm v12 + APFS 下 inode 必然不同，不能用 inode 判定新旧，见 Makefile 头部说明）
+	@if [ -f "$(PNPM_DIR)/node_modules/dsh-plugin-model-proxy/lib/client.js" ] && cmp -s '$(PKG_DIR)/lib/client.js' '$(PNPM_DIR)/node_modules/dsh-plugin-model-proxy/lib/client.js'; then \
+		echo "  ✓ 与当前构建内容一致（硬链接/clone/拷贝均可）"; \
 	else \
-		echo "  ! 未与源码建立链接，node_modules 是旧拷贝——检查 nodeLinker 与残留缓存"; \
+		echo "  ! node_modules 产物与当前构建不一致，是旧拷贝——检查构建输出与 pnpm 缓存"; \
 		exit 1; \
 	fi
 	# 机制级校验 3：插件名必须在 dsh.profile.bundles 层，否则不会被加载
