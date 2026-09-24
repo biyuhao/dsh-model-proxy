@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-model-proxy",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "DSH plugin: per-model proxy routing (http/https/socks5) with a settings UI — e.g. opencode/muse-spark-1.2-contributor needs a proxy while sibling models stay direct",
   "type": "module",
   "keywords": [
@@ -66,10 +66,9 @@
     "socks": "^2.8.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": ">=4.0.0",
+    "@deepseek-ai/cordis": ">=4.0.4",
     "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6",
-    "@deepseek-ai/dsh-settings": ">=0.1.2-alpha.3",
-    "@deepseek-ai/schemastery": ">=3.0.0"
+    "@deepseek-ai/schemastery": ">=3.18.4"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
@@ -78,17 +77,14 @@
     "@deepseek-ai/dsh-llm": {
       "optional": false
     },
-    "@deepseek-ai/dsh-settings": {
-      "optional": false
-    },
     "@deepseek-ai/schemastery": {
       "optional": true
     }
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/cordis": "^4.0.4",
     "@deepseek-ai/dsh-llm": "0.1.2-alpha.3",
-    "@deepseek-ai/dsh-settings": "0.1.2-alpha.3",
+    "@deepseek-ai/schemastery": "^3.18.4",
     "@types/node": "^22.20.1",
     "@types/react": "^19.2.18",
     "esbuild": "^0.28.2",

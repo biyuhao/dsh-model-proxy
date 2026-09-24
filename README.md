@@ -17,12 +17,12 @@ else stays direct, and the configured endpoint is never rewritten.
 
 - **Per-rule routing**: `{provider, model, proxyUrl, enabled}` — specificity: exact model > prefix `muse-*` > `*`.
 - **Purpose filter**: optional per-rule `purpose` (e.g. `compaction`) so chat goes through the proxy while background calls stay direct.
-- **credentialRef**: keep proxy passwords in the DSH credentials service instead of settings.yaml; rules reference them by name (`user:password` entries). Soft dependency — installs without it keep working.
+- **credentialRef**: keep proxy passwords in the DSH credentials service instead of the profile config; rules reference them by name (`user:password` entries). Soft dependency — installs without it keep working.
 - **Auto probe**: newly configured proxies are connectivity-tested once (CONNECT/socks handshake, no model quota); results go to the host log.
 - **Protocols**: `http://`, `https://` (CONNECT via `undici.ProxyAgent`), `socks5://` / `socks5h://` (via optional `socks`, tunnelled by undici `Agent` + custom connect).
 - **Zero baseURL mutation** — keep the real upstream.
 - **Live**: change rules → next `llm/stream` uses them; in-flight streams unaffected.
-- **UI**: `Settings → Plugins → Model Proxy` card (also works via `~/.dsh/settings.yaml`).
+- **UI**: `Settings → Plugins → Model Proxy` card; edits commit live to the profile patch (hand-written yaml works too — see "Via file").
 - **Provider picker**: dropdown groups user-configured providers first (derived from `llm.providers` × settings mirror, same semantics as the built-in Models page); bare directory routes follow, and "Custom…" accepts anything — hand-written yaml rules, wildcards, gateways the catalog doesn't know. Provider and model fields are dropdowns fed by the live host catalog (`llm.providers` / `llm.models`, refreshed on `llm/adapters-updated`); a "Custom…" entry keeps free text for wildcards (`muse-*`, `*`) or not-yet-installed providers.
 - **Batch & grouped management**: adding rules checks multiple models for one provider at once — one rule each, sharing proxy/purpose/credential; the list groups cards by provider with group-level apply-proxy, enable/disable-all, and delete (cross-provider grouping never affects match order).
 
@@ -67,7 +67,7 @@ module resolution anchors at the profile). Then insert exactly ONE loader row:
 ```yaml
 # ~/.dsh/cordis.patch.yml  (or a --patch overlay)
 - insert:
-    - id: model-proxy/host
+    - id: model-proxy
       name: dsh-plugin-model-proxy
       config: {}
 ```
@@ -99,28 +99,31 @@ from the profile.
 
 ### Via file
 
-`~/.dsh/settings.yaml`:
+The entry's `config` in the active profile patch (`~/.dsh/profiles/<name>/cordis.patch.yml`;
+the settings UI writes edits to the same row):
 
 ```yaml
-model-proxy:
-  enabled: true
-  debug: false
-  defaultProxy: ""  # fallback when no rule matches
-  rules:
-    - provider: opencode
-      model: muse-spark-1.2-contributor
-      proxyUrl: socks5://127.0.0.1:1080
-      enabled: true
-    - provider: opencode
-      model: "*"
-      proxyUrl: ""  # direct for the rest of this provider
+- id: model-proxy
+  config:
+    enabled: true
+    debug: false
+    defaultProxy: ""  # fallback when no rule matches
+    rules:
+      - provider: opencode
+        model: muse-spark-1.2-contributor
+        proxyUrl: socks5://127.0.0.1:1080
+        enabled: true
+      - provider: opencode
+        model: "*"
+        proxyUrl: ""  # direct for the rest of this provider
 ```
 
 `proxyUrl: ""` means **direct (exempt)**. `socks5h://` resolves DNS at the proxy.
+Field changes commit live (volatile Config) without restarting the profile.
 
 ## How it works (non-invasive)
 
-1. Host registers `model-proxy` settings namespace (`installSettingsSection`, live).
+1. The plugin's volatile Config fields are the `model-proxy` settings section (the loader entry id); edits commit live.
 2. Wraps `globalThis.fetch` reversibly.
 3. Listens on `llm/stream` waterfall, resolves `proxyUrl` for `(provider, model)` via `AsyncLocalStorage`, then injects a `dispatcher` into the adapter's `fetch` — for proxied requests it routes through `undici.fetch` (Node's native global fetch ignores custom dispatchers), with `undici.ProxyAgent` for `http(s)` and an undici `Agent` + socks `connect` (with TLS) for `socks5/h`.
 4. Browser registers `settings.plugin.item` with key `model-proxy` — automatically paired by the Plugins tab (`served ∩ registered`).

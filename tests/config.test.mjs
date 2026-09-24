@@ -10,13 +10,20 @@ const baseConfig = () => ({ enabled: true, debug: false, defaultProxy: '', rules
 
 test('schema resolves hand-written yaml rules without id (no function-default trap)', () => {
   const cfg = ModelProxyConfig({ rules: [{ provider: 'opencode', model: 'muse-spark', proxyUrl: '' }] })
-  assert.equal(cfg.enabled, true)
-  assert.equal(cfg.rules[0].enabled, true)
+  // Volatile fields resolve to live references; the snapshot carries the values.
+  assert.equal(cfg.enabled.get(), true)
+  assert.equal(cfg.rules.get()[0].enabled, true)
 })
 
 test('schema materializes defaults for bare entry', () => {
   const cfg = ModelProxyConfig({})
-  assert.deepEqual(cfg, { enabled: true, rules: [], defaultProxy: '', debug: false, catalog: { providers: [], models: [] } })
+  assert.deepEqual({
+    enabled: cfg.enabled.get(),
+    rules: cfg.rules.get(),
+    defaultProxy: cfg.defaultProxy.get(),
+    debug: cfg.debug.get(),
+    catalog: cfg.catalog.get(),
+  }, { enabled: true, rules: [], defaultProxy: '', debug: false, catalog: { providers: [], models: [] } })
 })
 
 test('rejects whitespace-padded provider / model', () => {
@@ -146,7 +153,7 @@ test('catalog mirror field is optional, validates, and never affects routing', (
   // Bare documents materialize an empty mirror (nested defaults); the card
   // treats an empty mirror exactly like an absent one.
   const bare = ModelProxyConfig({})
-  assert.deepEqual(bare.catalog, { providers: [], models: [] })
+  assert.deepEqual(bare.catalog.get(), { providers: [], models: [] })
   // A host-written mirror round-trips through the schema.
   const mirror = {
     providers: [
@@ -156,7 +163,7 @@ test('catalog mirror field is optional, validates, and never affects routing', (
     models: [{ provider: 'mine', models: [{ id: 'm1', name: 'M One' }, { id: 'm2' }] }],
   }
   const cfg = ModelProxyConfig({ ...baseConfig(), catalog: mirror })
-  assert.deepEqual(cfg.catalog, mirror)
+  assert.deepEqual(cfg.catalog.get(), mirror)
   // Validation and routing ignore the mirror entirely.
   assert.doesNotThrow(() => assertServiceable({ ...baseConfig(), catalog: mirror }))
   assert.equal(resolveProxy({ ...baseConfig(), catalog: mirror }, 'mine', 'm1'), undefined)

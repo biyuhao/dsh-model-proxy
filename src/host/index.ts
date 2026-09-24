@@ -1,20 +1,20 @@
 /**
  * Host plugin: dsh-plugin-model-proxy
  *
- * - Registers `model-proxy` settings namespace (live, no restart)
+ * - Declares live Config (volatile fields) — the settings UI projects it as
+ *   the `model-proxy` section; edits commit without remounting
  * - Wraps global fetch (reversible)
  * - Intercepts `llm/stream` waterfall to route per (provider, model, purpose)
  * - Composes credentialRef entries over rule proxyUrls (soft credentials dep)
  * - Probes newly configured proxies without consuming model quota
  *
- * Zero invasion: only uses public seams (ctx.settings, ctx.llm waterfall,
- * ctx.get('credentials'), global fetch dispatcher).
+ * Zero invasion: only uses public seams (Config + ctx.settings mirror writes,
+ * ctx.llm waterfall, ctx.get('credentials'), global fetch dispatcher).
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
-import { ModelProxyConfig, assertServiceable, resolveProxy, redactProxyUrl, type ModelProxyConfig as ConfigType, type ProxyRule } from './config.js'
+import { assertServiceable, resolveProxy, redactProxyUrl, type ModelProxyConfig as ConfigType, type ModelProxyConfigRef, type ProxyRule } from './config.js'
 import { catalogsEqual, computeDirectoryCatalog } from './directory.js'
 import { als, installFetchWrapper, shouldWrapFetch } from './fetch-wrap.js'
 import { clearDispatcherCache, socksDependencyAvailable } from './dispatcher.js'
@@ -23,24 +23,24 @@ import { probeProxy } from './probe.js'
 
 export const name = 'dsh-plugin-model-proxy'
 export const inject = ['settings', 'llm']
+export { Config } from './config.js'
 
 const NS = 'model-proxy' as const
 
-export function apply(ctx: Context, entry: ConfigType): void {
-  // Normalize entry through schema defaults so bare {} works
-  let normalizedEntry: ConfigType
-  try {
-    normalizedEntry = ModelProxyConfig(entry ?? ({} as unknown)) as ConfigType
-    assertServiceable(normalizedEntry)
-  } catch (err) {
-    ctx.logger.warn(`[model-proxy] composition config invalid: ${String(err)}`)
-    normalizedEntry = { enabled: true, rules: [], defaultProxy: '', debug: false } as ConfigType
-  }
+export function apply(ctx: Context, config: ModelProxyConfigRef): void {
+  // Each field is a volatile reference the Loader commits in place; every
+  // read takes the current committed snapshot.
+  const current = (): ConfigType => ({
+    enabled: config.enabled.get(),
+    rules: config.rules.get(),
+    defaultProxy: config.defaultProxy.get(),
+    debug: config.debug.get(),
+    catalog: config.catalog.get(),
+  })
 
-  // Authoritative config source: the composition entry until the settings
-  // layer attaches, then the resolved scope. installSettingsSection calls
-  // setSource before the matching onChange, so no polling or timers needed.
-  let current: () => ConfigType = () => normalizedEntry
+  // Cross-field validation the schema cannot express; a failure fails the
+  // fiber at load with the offending rule named in the diagnostics.
+  assertServiceable(current())
 
   // ── credentialRef resolution ────────────────────────────────────────────
   // The credentials service resolves ASYNC while the llm/stream listener must
@@ -115,8 +115,8 @@ export function apply(ctx: Context, entry: ConfigType): void {
     }
   }
 
-  // Reconcile is async (credential resolution), onChange is sync — serialize
-  // runs and coalesce bursts of config writes into one trailing run.
+  // Reconcile is async (credential resolution); serialize runs and coalesce
+  // bursts of config commits into one trailing run.
   let reconciling = false
   let pendingReconcile = false
   const runReconcile = async (): Promise<void> => {
@@ -167,11 +167,9 @@ export function apply(ctx: Context, entry: ConfigType): void {
     void runReconcile()
   }
 
-  // ── fetch wrapper lifecycle: installed only while routing is possible ──
-  // Wrapping globalThis.fetch is a process-wide side effect, so the wrapper
-  // exists exactly while shouldWrapFetch(config) holds: disabled or fully
-  // direct configs keep the global untouched. Kept in sync from the entry
-  // config and every settings change; the fiber disposer always unwinds.
+  // ── fetch wrapper lifecycle ─────────────────────────────────────────────
+  // The wrapper exists exactly while shouldWrapFetch(config) holds — disabled
+  // or fully direct configs keep the global untouched; the disposer unwinds.
   let uninstallFetch: (() => void) | undefined
   const fetchLogger = { error: (msg: string) => ctx.logger.error(msg) }
   const syncFetchWrapper = (): void => {
@@ -208,60 +206,46 @@ export function apply(ctx: Context, entry: ConfigType): void {
     if (n > 0) ctx.logger.info(`[model-proxy] closed ${n} dispatcher pool(s)`)
   }, 'model-proxy: dispatcher cache')
 
-  // 1) Settings namespace — live, validated, layered over entry.
-  // Registered AFTER the wrapper/disposer effects above so a synchronous
-  // first onChange cannot touch a not-yet-initialized binding.
-  // Uses ctx.inject(['settings']) for dsh-settings >= 0.1.2
-  const installSettings = (settingsService: SettingsProvider): void => {
-    settingsService.installSection(
-      ctx,
-      NS,
-      ModelProxyConfig as unknown as Parameters<typeof settingsService.installSection>[2],
-      entry as unknown,
-      {
-        validate(value: unknown) {
-          assertServiceable(value as ConfigType)
-        },
-        setSource(next: () => ConfigType) {
-          current = next as () => ConfigType
-        },
-        onChange() {
-          syncFetchWrapper()
-          reconcileConfigSideEffects()
-          const cfg = current()
-          if (!cfg.debug) return
-          const summary = cfg.rules
-            .map((r) => `${r.provider}/${r.model}→${r.proxyUrl ? redactProxyUrl(r.proxyUrl) : 'direct'}${r.purpose ? `@${r.purpose}` : ''}`)
-            .join(', ')
-          ctx.logger.info(
-            `[model-proxy] config applied: enabled=${cfg.enabled} rules=${cfg.rules.length}${summary ? ` [${summary}]` : ''} defaultProxy=${cfg.defaultProxy ? redactProxyUrl(cfg.defaultProxy) : 'direct'}`,
-          )
-        },
-      }
+  // 1) Volatile config commits — re-derive every side effect the initial
+  // config seeded. Registered AFTER the effects above so the first commit
+  // cannot touch a not-yet-initialized binding.
+  ctx.on('loader/volatile-update', () => {
+    syncFetchWrapper()
+    try {
+      assertServiceable(current())
+    } catch (err) {
+      // Already committed — warn and keep serving; failing here would hide
+      // the card entirely.
+      ctx.logger.warn(err)
+    }
+    reconcileConfigSideEffects()
+    const cfg = current()
+    if (!cfg.debug) return
+    const summary = cfg.rules
+      .map((r) => `${r.provider}/${r.model}→${r.proxyUrl ? redactProxyUrl(r.proxyUrl) : 'direct'}${r.purpose ? `@${r.purpose}` : ''}`)
+      .join(', ')
+    ctx.logger.info(
+      `[model-proxy] config applied: enabled=${cfg.enabled} rules=${cfg.rules.length}${summary ? ` [${summary}]` : ''} defaultProxy=${cfg.defaultProxy ? redactProxyUrl(cfg.defaultProxy) : 'direct'}`,
     )
-  }
+  })
 
-  // Use ctx.inject to get the settings service when available
   // 2) Directory mirror — host-computed provider/model catalog persisted into
   // our own namespace so cards on pages without the cross-namespace Typert
-  // remotes (`remote.llm` / `remote.session` / `remote.settings`, e.g.
-  // non-loopback pages) still render dropdowns via their own settings scope.
-  //
-  // Loop safety: bursts collapse into one trailing write through mirrorChain,
-  // and the deep-equal guard means an unchanged recompute never touches the
-  // document. Our own write re-triggers `settings/document-updated`, but the
-  // recompute then equals the mirror and skips — no write loop. The client
-  // never writes `catalog`. Only ids/display names are mirrored, never
-  // credentials or secrets (computeDirectoryCatalog extracts names only).
-  let settingsSvc: SettingsProvider | undefined
+  // remotes (`remote.llm` etc., e.g. non-loopback pages) still render
+  // dropdowns. Burst-safe via mirrorChain; the deep-equal guard breaks the
+  // self-triggered write loop (our update re-fires settings/document-updated).
+  // Ids/display names only, never credentials. dsh-settings is accessed
+  // structurally: describe() feeds the computation, update() persists.
+  type SettingsFace = {
+    describe?: () => Array<{ ns?: unknown; value?: unknown }>
+    update?: (ns: string, patch: Record<string, unknown>) => Promise<unknown>
+  }
+  let settingsSvc: SettingsFace | undefined
   let mirrorChain: Promise<void> = Promise.resolve()
   const refreshDirectoryMirror = (): void => {
     mirrorChain = mirrorChain.then(async () => {
       if (!settingsSvc) return
-      const face = settingsSvc as unknown as {
-        describe?: () => Array<{ ns?: unknown; value?: unknown }>
-        update?: (ns: string, patch: Record<string, unknown>) => Promise<unknown>
-      }
+      const face = settingsSvc
       if (typeof face.describe !== 'function' || typeof face.update !== 'function') return
       let namespaces: Array<{ ns?: unknown; value?: unknown }> = []
       try {
@@ -283,15 +267,14 @@ export function apply(ctx: Context, entry: ConfigType): void {
   }
   ctx.on('llm/adapters-updated', () => refreshDirectoryMirror())
   ctx.on('settings/document-updated', () => refreshDirectoryMirror())
-  ctx.inject(['settings'], (settingsCtx: { settings: SettingsProvider }) => {
+  ctx.inject(['settings'], (settingsCtx: { settings: SettingsFace }) => {
     settingsSvc = settingsCtx.settings
-    installSettings(settingsCtx.settings)
     refreshDirectoryMirror()
   })
 
-  // Kick initial reconciliation (entry-level config, credential cache warmup,
-  // first probes). Fire-and-forget: failures are logged inside. The fetch
-  // wrapper itself was already synced from the entry config by its effect.
+  // Kick initial reconciliation (credential cache warmup, first probes); the
+  // fetch wrapper was already synced by its effect. Fire-and-forget: failures
+  // are logged inside.
   reconcileConfigSideEffects()
 
   // 3) llm/stream waterfall — per-request proxy decision

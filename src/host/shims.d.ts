@@ -2,10 +2,6 @@ declare module '@deepseek-ai/cordis' {
   export type Context = any
   export const Service: any
 }
-declare module '@deepseek-ai/dsh-settings' {
-  export function settingsNamespace(s: string): any
-  export function installSettingsSection(...args: any[]): void
-}
 declare module '@deepseek-ai/dsh-llm' {
   export type GenerateOptions = { provider: string; model: string; [k: string]: any }
 }

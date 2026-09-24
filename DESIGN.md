@@ -57,7 +57,7 @@
 | F6 | **范围控制**：支持同时配置多条规则，多 provider/多模型独立 | P0 |
 | F7 | **显式禁用**：`proxyUrl=""` / `enabled:false` 表示直连，用于在全局代理下对某模型豁免 | P1 |
 | F8 | **可观测**：日志与 `providerRetryAfter` / `requestId` 透传；可选 debug 日志哪条请求走了哪个代理 | P1 |
-| F9 | **GUI/CLI 配置**：settings 页面可视化编辑，兼容 `~/.dsh/settings.yaml` 手写 | P1 |
+| F9 | **GUI/文件配置**：settings 页面可视化编辑；volatile Config 字段即 profile patch 中该 entry 的 `config`，手写同样生效且热更新 | P1 |
 | F10 | **测试旁路**：提供 `probe` 能力（类似“检测连接”）不发真实模型请求即可校验代理可达 | P2 |
 
 ### 2.2 非功能性需求
@@ -203,24 +203,25 @@ export interface ModelProxyConfig {
 * 重复 `provider+model` 拒绝并指明行号。
 * `socks5://` 需可选依赖可用，否则校验阶段给 warning（不硬拒绝，运行时再 `LlmError` 提示安装 `socks`）。
 
-存储示例（`~/.dsh/settings.yaml` 段）：
+存储示例（`~/.dsh/profiles/<name>/cordis.patch.yml` 中该 entry 的 `config`，volatile 字段改动热提交、无需重启）：
 
 ```yaml
-model-proxy:
-  rules:
-    - provider: opencode
-      model: muse-spark-1.2-contributor
-      proxyUrl: socks5://127.0.0.1:1080
-    - provider: opencode
-      model: "*"
-      proxyUrl: ""           # 该 provider 其余模型直连
-    - provider: acme-gateway
-      model: "*"
-      proxyUrl: http://127.0.0.1:7890
-  debug: false
+- id: model-proxy
+  config:
+    rules:
+      - provider: opencode
+        model: muse-spark-1.2-contributor
+        proxyUrl: socks5://127.0.0.1:1080
+      - provider: opencode
+        model: "*"
+        proxyUrl: ""           # 该 provider 其余模型直连
+      - provider: acme-gateway
+        model: "*"
+        proxyUrl: http://127.0.0.1:7890
+    debug: false
 ```
 
-也支持 `cordis.patch.yml` 覆盖，无需 GUI。
+settings UI 的编辑也写回同一行，两种途径共享一份持久化。
 
 ### 6.2 路由匹配
 
@@ -415,7 +416,7 @@ dsh-model-proxy/
 
 ```yaml
 - insert:
-    - id: model-proxy/host
+    - id: model-proxy
       name: dsh-plugin-model-proxy
       config: {}
 ```

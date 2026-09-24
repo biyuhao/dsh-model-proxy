@@ -8,8 +8,12 @@
 # browser half is discovered automatically from package.json#dsh.client and
 # served at /plugins/dsh-plugin-model-proxy/client.js — never add a second
 # `model-proxy/client` loader row, it would run browser code in the host.
+#
+# The entry id is the settings namespace: the settings UI projects the
+# entry's volatile Config fields as section `model-proxy`, and the client
+# card binds `configForms.get('model-proxy')`. Renaming the row breaks both.
 
 - insert:
-    - id: model-proxy/host
+    - id: model-proxy
       name: dsh-plugin-model-proxy
       config: {}

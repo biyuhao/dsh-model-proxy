@@ -2,26 +2,6 @@ declare module '@deepseek-ai/cordis' {
   export type Context = any
   export const Service: any
 }
-declare module '@deepseek-ai/dsh-settings' {
-  export interface SettingsProvider {
-    installSection(
-      owner: any,
-      ns: string,
-      schema: any,
-      entry: any,
-      hooks: {
-        validate?: (value: unknown) => void
-        setSource: (next: () => any) => void
-        onChange: () => void
-      }
-    ): void
-  }
-  export class SettingsConflictError extends Error {
-    code: string
-    expected: number
-    actual: number
-  }
-}
 declare module '@deepseek-ai/dsh-llm' {
   export type GenerateOptions = { provider: string; model: string; [k: string]: any }
 }

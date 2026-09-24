@@ -1,9 +1,10 @@
 /**
  * Settings schema for dsh-plugin-model-proxy (Host).
  *
- * Namespace: `model-proxy`
- * Single source of truth for validation — used by Host registration
- * and mirrored in Client for fast local feedback.
+ * Exported as `Config`: the Loader entry's Cordis Config — the settings UI
+ * projects its volatile fields as the `model-proxy` section (the entry id).
+ * Single source of truth for validation — used by Host reads and mirrored
+ * in Client for fast local feedback.
  */
 
 import z from '@deepseek-ai/schemastery'
@@ -90,15 +91,14 @@ export const DirectoryCatalogSchema: any = z.object({
 })
 
 export const ModelProxyConfigSchema: any = z.object({
-  enabled: z.boolean().default(true),
-  rules: z.array(ProxyRuleSchema).default([]),
-  defaultProxy: z.string().default(''),
-  debug: z.boolean().default(false),
-  // No .default() on `catalog` itself; the nested field defaults still
-  // materialize an empty mirror ({providers: [], models: []}) on bare
-  // documents. The card treats an empty mirror exactly like an absent one,
-  // and the host overwrites it on the first mirror pass.
-  catalog: DirectoryCatalogSchema,
+  enabled: z.boolean().default(true).volatile(),
+  rules: z.array(ProxyRuleSchema).default([]).volatile(),
+  defaultProxy: z.string().default('').volatile(),
+  debug: z.boolean().default(false).volatile(),
+  // No .default() on `catalog` itself — nested defaults still materialize an
+  // empty mirror on bare documents. Volatile so the host mirror write commits
+  // without remounting the entry.
+  catalog: DirectoryCatalogSchema.volatile(),
 })
 
 export interface ModelProxyConfig {
@@ -110,6 +110,22 @@ export interface ModelProxyConfig {
   catalog?: DirectoryCatalog
 }
 export const ModelProxyConfig: any = ModelProxyConfigSchema
+/** Loader-facing alias; tests and host internals keep the `ModelProxyConfig` name. */
+export const Config: any = ModelProxyConfigSchema
+
+/** A live config field handle; each read yields the current committed snapshot. */
+export interface VolatileRef<T> {
+  get(): T
+}
+
+/** `apply` receives one stable volatile reference per Config field. */
+export interface ModelProxyConfigRef {
+  enabled: VolatileRef<boolean>
+  rules: VolatileRef<ProxyRule[]>
+  defaultProxy: VolatileRef<string>
+  debug: VolatileRef<boolean>
+  catalog: VolatileRef<DirectoryCatalog | undefined>
+}
 
 const SUPPORTED_SCHEMES = new Set(['http:', 'https:', 'socks5:', 'socks5h:', 'socks:'])
 

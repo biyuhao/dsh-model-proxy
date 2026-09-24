@@ -1,6 +1,6 @@
 /**
  * credentialRef support: compose a proxyUrl with a secret fetched from the
- * DSH credentials service, keeping plaintext passwords out of settings.yaml.
+ * DSH credentials service, keeping plaintext passwords out of the profile config.
  *
  * The credentials service is a SOFT dependency (dsh-llm-deepseek follows the
  * same pattern): it is looked up via ctx.get('credentials') at runtime, never
