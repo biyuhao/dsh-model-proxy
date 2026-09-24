@@ -5,7 +5,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { ModelProxyController, ensureRuleIds } from '../.test-build/controller.js'
+import { ModelProxyController, ensureRuleIds, normalizeConfig, parseHeaderRows, parseHeadersText } from '../.test-build/controller.js'
 
 const LEGACY_RULE = {
   id: 'r1',
@@ -52,27 +52,77 @@ test('save() persists sanitized rules through the scope', async () => {
     },
   }
   const ctrl = new ModelProxyController(scope)
-  await ctrl.save({
+  const next = normalizeConfig({
     enabled: true,
+    proxyHosts: [],
     debug: false,
     defaultProxy: '',
     rules: [LEGACY_RULE],
   })
+  await ctrl.save(next)
+  const hostsWrite = writes.find(([field]) => field === 'proxyHosts')
   const rulesWrite = writes.find(([field]) => field === 'rules')
-  assert.ok(rulesWrite, 'rules write happened first')
-  assert.deepEqual(rulesWrite[1], [{
+  assert.ok(hostsWrite, 'proxy hosts write happened')
+  assert.ok(rulesWrite, 'rules write happened')
+  assert.equal(writes[0][0], 'proxyHosts', 'hosts are written before their references')
+  assert.equal(hostsWrite[1].length, 1)
+  assert.equal(rulesWrite[1][0].proxyHostId, hostsWrite[1][0].id)
+  assert.equal(rulesWrite[1][0].proxyUrl, undefined)
+  assert.deepEqual(rulesWrite[1][0], {
     id: 'r1',
     provider: 'opencode-meta',
     model: '*',
-    proxyUrl: 'socks5://127.0.0.1:1080',
+    proxyHostId: hostsWrite[1][0].id,
     enabled: true,
-  }])
-  assert.equal(writes[0][0], 'rules', 'rules is the first write (rejection-prone field first)')
+  })
+  assert.equal(writes[2][0], 'defaultProxyHostId')
+})
+
+test('save() rejects a refused settings write', async () => {
+  const scope = {
+    getSnapshot: () => ({ status: 'ready', writable: true, value: { enabled: true, proxyHosts: [], rules: [], defaultProxy: '', debug: false } }),
+    subscribe: () => () => {},
+    set: async (field) => field !== 'proxyHosts',
+  }
+  const ctrl = new ModelProxyController(scope)
+  await assert.rejects(
+    ctrl.save({ enabled: true, proxyHosts: [], rules: [], defaultProxy: '', debug: false }),
+    /settings write rejected for proxyHosts/,
+  )
 })
 
 test('ensureRuleIds still fills missing ids on sanitized shapes', () => {
   const cfg = ensureRuleIds({ enabled: true, rules: [{ provider: 'p', model: 'm', proxyUrl: '' }], defaultProxy: '', debug: false })
   assert.ok(cfg.rules[0].id, 'id generated')
+  const same = ensureRuleIds({ enabled: true, rules: [{ provider: 'p', model: 'm', proxyUrl: '' }], defaultProxy: '', debug: false })
+  assert.equal(cfg.rules[0].id, same.rules[0].id)
+})
+
+test('parseHeadersText rejects proxy control headers and oversized values', () => {
+  assert.ok(parseHeadersText('proxy-authenticate: x').error)
+  assert.ok(parseHeadersText(`x-test: ${'x'.repeat(4097)}`).error)
+})
+
+test('parseHeaderRows switches a fixed Header to every dynamic source', () => {
+  for (const source of ['sessionId', 'provider', 'model', 'purpose']) {
+    assert.deepEqual(
+      parseHeaderRows([{ key: 'header-1', name: 'x-request-context', value: 'stale-fixed-value', source }]),
+      { headers: undefined, sources: { 'x-request-context': source } },
+    )
+  }
+})
+
+test('parseHeaderRows keeps fixed and dynamic Headers together', () => {
+  assert.deepEqual(
+    parseHeaderRows([
+      { key: 'header-1', name: 'x-fixed', value: 'value', source: 'fixed' },
+      { key: 'header-2', name: 'x-session', value: '', source: 'sessionId' },
+    ]),
+    {
+      headers: { 'x-fixed': 'value' },
+      sources: { 'x-session': 'sessionId' },
+    },
+  )
 })
 
 test('dropping unknown keys is loud: console.warn names each stripped field', async (t) => {
@@ -146,4 +196,47 @@ test('groupByProvider preserves first-appearance group order and intra-group ord
   assert.deepEqual(groups[0].rules.map((r) => r.model), ['b1', 'b2'])
   assert.deepEqual(groups[1].rules.map((r) => r.model), ['a1', 'a2'])
   assert.deepEqual(groupByProvider([]), [])
+})
+
+test('normalizeConfig migrates inline URLs to reusable hosts and keeps direct rules direct', () => {
+  const cfg = normalizeConfig({
+    enabled: true,
+    proxyHosts: [],
+    rules: [
+      { provider: 'p', model: 'a', proxyUrl: 'socks5://127.0.0.1:1080', enabled: true },
+      { provider: 'p', model: 'b', proxyUrl: 'socks5://127.0.0.1:1080', enabled: true },
+      { provider: 'p', model: 'c', proxyUrl: '', headers: { 'x-test': 'yes' }, enabled: true },
+    ],
+    defaultProxy: 'http://127.0.0.1:7890',
+    debug: false,
+  })
+  assert.equal(cfg.proxyHosts.length, 2)
+  assert.equal(cfg.proxyHosts[0].proxyUrl, 'socks5://127.0.0.1:1080')
+  assert.equal(cfg.rules[0].proxyHostId, cfg.proxyHosts[0].id)
+  assert.equal(cfg.rules[1].proxyHostId, cfg.proxyHosts[0].id)
+  assert.equal(cfg.rules[2].proxyHostId, undefined)
+  assert.equal(cfg.rules[2].proxyUrl, undefined)
+  assert.deepEqual(cfg.rules[2].headers, { 'x-test': 'yes' })
+  assert.equal(cfg.defaultProxyHostId, cfg.proxyHosts[1].id)
+  assert.equal(cfg.defaultProxy, '')
+  assert.deepEqual(normalizeConfig(cfg), cfg, 'normalization is idempotent')
+})
+
+test('normalizeConfig canonicalizes dynamic Header sources', () => {
+  const cfg = normalizeConfig({
+    enabled: true,
+    proxyHosts: [],
+    rules: [{
+      provider: 'p',
+      model: '*',
+      proxyUrl: '',
+      headers: { 'x-opencode-session': 'stale-fixed-value' },
+      headerValueSources: { 'x-opencode-session': 'sessionId' },
+      enabled: true,
+    }],
+    defaultProxy: '',
+    debug: false,
+  })
+  assert.equal(cfg.rules[0].headers, undefined)
+  assert.deepEqual(cfg.rules[0].headerValueSources, { 'x-opencode-session': 'sessionId' })
 })

@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { ModelProxyConfig, assertServiceable, resolveProxy, redactProxyUrl } from '../lib/host/config.js'
+import { ModelProxyConfig, assertServiceable, resolveProxy, resolveRoute, redactProxyUrl } from '../lib/host/config.js'
 
 const baseConfig = () => ({ enabled: true, debug: false, defaultProxy: '', rules: [] })
 
@@ -15,15 +15,29 @@ test('schema resolves hand-written yaml rules without id (no function-default tr
   assert.equal(cfg.rules.get()[0].enabled, true)
 })
 
+test('schema round-trips reusable proxy hosts and default host selection', () => {
+  const cfg = ModelProxyConfig({
+    proxyHosts: [{ id: 'office', name: 'Office', proxyUrl: 'socks5://127.0.0.1:1080' }],
+    defaultProxyHostId: 'office',
+    rules: [{ provider: 'p', model: '*', proxyHostId: 'office', headerValueSources: { 'x-session': 'sessionId' } }],
+  })
+  assert.deepEqual(cfg.proxyHosts.get(), [{ id: 'office', name: 'Office', proxyUrl: 'socks5://127.0.0.1:1080' }])
+  assert.equal(cfg.defaultProxyHostId.get(), 'office')
+  assert.equal(cfg.rules.get()[0].proxyHostId, 'office')
+  assert.deepEqual(cfg.rules.get()[0].headerValueSources, { 'x-session': 'sessionId' })
+})
+
 test('schema materializes defaults for bare entry', () => {
   const cfg = ModelProxyConfig({})
   assert.deepEqual({
     enabled: cfg.enabled.get(),
+    proxyHosts: cfg.proxyHosts.get(),
     rules: cfg.rules.get(),
+    defaultProxyHostId: cfg.defaultProxyHostId.get(),
     defaultProxy: cfg.defaultProxy.get(),
     debug: cfg.debug.get(),
     catalog: cfg.catalog.get(),
-  }, { enabled: true, rules: [], defaultProxy: '', debug: false, catalog: { providers: [], models: [] } })
+  }, { enabled: true, proxyHosts: [], rules: [], defaultProxyHostId: '', defaultProxy: '', debug: false, catalog: { providers: [], models: [] } })
 })
 
 test('rejects whitespace-padded provider / model', () => {
@@ -49,6 +63,29 @@ test('defaultProxy validation: bad URL / empty hostname / unsupported scheme', (
   // good values pass
   assert.doesNotThrow(() => assertServiceable({ ...baseConfig(), defaultProxy: 'http://127.0.0.1:7890' }))
   assert.doesNotThrow(() => assertServiceable({ ...baseConfig(), defaultProxy: 'socks5h://u:p@h:1080' }))
+})
+
+test('proxy host references validate and resolve through the host profile', () => {
+  const cfg = {
+    enabled: true,
+    debug: false,
+    proxyHosts: [{ id: 'office', name: 'Office', proxyUrl: 'socks5://127.0.0.1:1080' }],
+    defaultProxyHostId: '',
+    defaultProxy: '',
+    rules: [{ provider: 'p', model: '*', proxyHostId: 'office', enabled: true }],
+  }
+  assert.doesNotThrow(() => assertServiceable(cfg))
+  assert.deepEqual(resolveRoute(cfg, 'p', 'm', undefined, (rule) => cfg.proxyHosts.find((h) => h.id === rule.proxyHostId)?.proxyUrl), {
+    proxyUrl: 'socks5://127.0.0.1:1080',
+  })
+  assert.throws(
+    () => assertServiceable({ ...cfg, rules: [{ ...cfg.rules[0], proxyHostId: 'missing' }] }),
+    /unknown proxy host/,
+  )
+  assert.throws(
+    () => assertServiceable({ ...cfg, rules: [{ ...cfg.rules[0], proxyUrl: 'http://other:1' }] }),
+    /cannot set both/,
+  )
 })
 
 test('routing: exact beats wildcard; "" exempts; disabled rules skipped; fallback applies', () => {
@@ -142,11 +179,11 @@ test('globally disabled config routes nothing', () => {
   assert.equal(resolveProxy(cfg, 'p', 'anything'), undefined)
 })
 
-test('redactProxyUrl hides password but keeps shape', () => {
+test('redactProxyUrl hides credentials and URL data', () => {
   const out = redactProxyUrl('socks5://user:secretpw@host:1080')
-  assert.ok(out.includes('***'))
-  assert.ok(!out.includes('secretpw'))
-  assert.ok(out.startsWith('socks5://user:'))
+  assert.equal(out, 'socks5://***@host:1080')
+  assert.equal(redactProxyUrl('socks5://token@host:1080?key=secret#fragment'), 'socks5://***@host:1080')
+  assert.equal(redactProxyUrl('not a url'), '[invalid proxy URL]')
 })
 
 test('catalog mirror field is optional, validates, and never affects routing', () => {

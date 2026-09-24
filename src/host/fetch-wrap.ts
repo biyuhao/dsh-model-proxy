@@ -1,7 +1,4 @@
-/**
- * Reversible global fetch wrapper.
- * Only injects dispatcher when AsyncLocalStorage holds a proxyUrl.
- */
+/** Reversible fetch wrapper for proxy dispatch and fixed headers. */
 
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { fetch as undiciFetch, Request as UndiciRequest } from 'undici'
@@ -12,28 +9,40 @@ export interface ProxyContext {
   proxyUrl?: string
   provider: string
   model: string
+  /** Fixed extra headers of the matched rule; direct mode may send them too. */
+  headers?: Readonly<Record<string, string>>
 }
 
 export const als = new AsyncLocalStorage<ProxyContext>()
 
 type FetchFn = typeof fetch
 
-/**
- * Whether the config state justifies touching globalThis.fetch at all.
- *
- * The wrapper is a process-wide side effect, so it must only be installed
- * while some rule (or the default fallback) could actually route a request
- * through a proxy. Globally disabled or fully-empty configs keep the global
- * fetch untouched.
- */
+/** Install the wrapper only when a route or fixed header may be applied. */
 export function shouldWrapFetch(config: {
   enabled: boolean
   defaultProxy?: string
-  rules?: ReadonlyArray<{ proxyUrl: string; enabled?: boolean }>
+  defaultProxyHostId?: string
+  proxyHosts?: ReadonlyArray<{ id: string; proxyUrl: string }>
+  rules?: ReadonlyArray<{
+    proxyUrl?: string
+    proxyHostId?: string
+    headers?: Readonly<Record<string, string>>
+    headerValueSources?: Readonly<Record<string, string>>
+    enabled?: boolean
+  }>
 }): boolean {
   if (!config.enabled) return false
-  if (config.defaultProxy) return true
-  return (config.rules ?? []).some((r) => r.enabled !== false && r.proxyUrl !== '')
+  if (config.defaultProxy || config.defaultProxyHostId) return true
+  if ((config.proxyHosts ?? []).some((host) => host.proxyUrl !== '')) return true
+  return (config.rules ?? []).some((r) => {
+    if (r.enabled === false) return false
+    const hasInlineUrl = r.proxyUrl !== undefined && r.proxyUrl !== ''
+    const hasHost = r.proxyHostId !== undefined && r.proxyHostId !== ''
+    const hasHeaders =
+      (r.headers !== undefined && Object.keys(r.headers).length > 0) ||
+      (r.headerValueSources !== undefined && Object.keys(r.headerValueSources).length > 0)
+    return hasInlineUrl || hasHost || hasHeaders
+  })
 }
 
 /** Minimal logger face so the host can route diagnostics through ctx.logger. */
@@ -47,63 +56,137 @@ const consoleLogger: FetchWrapLogger = {
   error: (msg) => console.error(msg),
 }
 
-/**
- * Install the wrapper around globalThis.fetch and return its disposer.
- *
- * Installation always wraps whatever is currently installed, even if that is
- * already a model-proxy wrapper from another plugin instance. This matters for
- * cordis-plugin-hmr: `partialReload` re-applies a plugin BEFORE the old fiber's
- * disposers finish (they are started but not awaited), so a "detect and no-op"
- * policy would let the dying twin's restore run last and leave fetch unwrapped
- * entirely. Layered wrappers degrade gracefully instead: each layer only
- * restores itself if it is still the outermost function at dispose time, and a
- * superseded inner layer simply passes through (its ALS store is never set).
- */
+/** Add configured headers only when the request does not already have them. */
+export function applyExtraHeaders(
+  base: Headers,
+  extra: Readonly<Record<string, string>> | undefined,
+): Headers {
+  if (!extra) return base
+  for (const [name, value] of Object.entries(extra)) {
+    if (!base.has(name)) base.set(name, value)
+  }
+  return base
+}
+
+/** Collect headers from a RequestInit's `headers` field into a Headers instance. */
+function collectInitHeaders(initHeaders: unknown): Headers {
+  const out = new Headers()
+  if (initHeaders === undefined || initHeaders === null) return out
+  if (initHeaders instanceof Headers) {
+    initHeaders.forEach((v, k) => out.set(k, v))
+    return out
+  }
+  // Accept global, undici, array, and object header containers.
+  if (Array.isArray(initHeaders)) {
+    for (const pair of initHeaders as Array<[string, string]>) {
+      if (Array.isArray(pair) && pair.length >= 2) out.set(String(pair[0]), String(pair[1]))
+    }
+    return out
+  }
+  if (typeof initHeaders === 'object' && typeof (initHeaders as Headers).forEach === 'function') {
+    try {
+      ;(initHeaders as Headers).forEach((v, k) => out.set(k, v))
+    } catch {
+      // Treat non-iterable foreign Headers as empty.
+    }
+    return out
+  }
+  if (typeof initHeaders === 'object') {
+    for (const [k, v] of Object.entries(initHeaders as Record<string, unknown>)) {
+      out.set(k, String(v))
+    }
+    return out
+  }
+  return out
+}
+
+/** Read headers from global, undici, or cross-realm Request-like inputs. */
+function readInputHeaders(input: unknown): Headers | undefined {
+  if (typeof input !== 'object' || input === null) return undefined
+  const rec = input as Record<string, unknown>
+  if (typeof rec.url !== 'string') return undefined
+  const h = rec.headers
+  if (h instanceof Headers) {
+    const out = new Headers()
+    h.forEach((v, k) => out.set(k, v))
+    return out
+  }
+  if (h !== null && typeof h === 'object' && typeof (h as Headers).forEach === 'function') {
+    const out = new Headers()
+    try {
+      ;(h as Headers).forEach((v, k) => out.set(k, v))
+    } catch {
+      return undefined
+    }
+    return out
+  }
+  return undefined
+}
+
+/** Wrap global fetch and return a disposer safe for overlapping HMR instances. */
 export function installFetchWrapper(log: FetchWrapLogger = consoleLogger): () => void {
   const original = globalThis.fetch as FetchFn
 
   const wrapped: FetchFn = (async (input: RequestInfo | URL, init?: RequestInit & { dispatcher?: unknown }) => {
     const store = als.getStore()
-    if (!store?.proxyUrl) {
+    if (!store) {
       return (original as FetchFn)(input as unknown as Request, init as RequestInit)
     }
+    const extra = store.headers
+    const hasExtra = extra !== undefined && Object.keys(extra).length > 0
 
-    // Only called inside llm/stream — safe to proxy all fetches in this context.
-    // If needed, add URL allowlist (e.g. only https://example.com etc.), but
-    // context-scoping already isolates from non-LLM fetches.
+    if (!store.proxyUrl) {
+      if (!hasExtra) return (original as FetchFn)(input as unknown as Request, init as RequestInit)
+      // Direct mode still merges fixed headers into native fetch.
+      const merged = new Headers()
+      const inputHeaders = readInputHeaders(input)
+      inputHeaders?.forEach((v, k) => merged.set(k, v))
+      collectInitHeaders(init?.headers).forEach((v, k) => merged.set(k, v))
+      applyExtraHeaders(merged, extra)
+      return (original as FetchFn)(input as unknown as Request, { ...(init ?? {}), headers: merged } as RequestInit)
+    }
+
+    // ALS limits interception to the current LLM stream.
     try {
       const dispatcher = getOrCreateDispatcher(store.proxyUrl)
 
-      // undici's fetch brand-checks ITS OWN Request class, so a Request built
-      // by another realm (e.g. Node's global constructor) throws
-      // "Failed to parse URL from [object Request]". Adapters currently pass
-      // string URLs, but rebuild defensively so a future Request-passing
-      // caller degrades to working proxying instead of an opaque TypeError.
-      // Verified: `new undici.Request(foreignReq.url, foreignReq)` carries
-      // method/headers/body across realms; init.signal below still overrides
-      // per spec.
+      // Rebuild cross-realm Requests for undici and preserve their headers.
+      const isGlobalRequest = typeof Request !== 'undefined' && input instanceof Request
       let proxiedInput: unknown = input
-      if (typeof Request !== 'undefined' && input instanceof Request) {
+      if (isGlobalRequest) {
         proxiedInput = new UndiciRequest((input as Request).url, input as unknown as UndiciRequest)
       }
+      // Preserve headers from non-global Request-like inputs.
+      const foreignInputHeaders = !isGlobalRequest ? readInputHeaders(input) : undefined
 
-      // NOTE: Node's native (built-in) global fetch forwards `dispatcher` to
-      // its internal undici copy, whose Dispatcher/handler protocol does not
-      // match instances of the standalone undici package ("invalid onError
-      // method"), so for proxied requests we delegate to undici's own fetch,
-      // which fully supports `dispatcher` (including the socks Agent built in
-      // dispatcher.ts). Direct (no-proxy) requests keep using the original
-      // global fetch unchanged.
+      // Proxied requests use undici's dispatcher-aware fetch.
       const nextInit = { ...(init ?? {}), dispatcher } as RequestInit & { dispatcher: unknown }
+      if (hasExtra) {
+        // Input and init headers win; configured headers only fill gaps.
+        const merged = new Headers()
+        if (isGlobalRequest) {
+          const rebuilt = (proxiedInput as unknown as { headers: Headers }).headers
+          rebuilt.forEach((v, k) => merged.set(k, v))
+        } else if (foreignInputHeaders) {
+          foreignInputHeaders.forEach((v, k) => merged.set(k, v))
+        }
+        const initMerged = collectInitHeaders(init?.headers)
+        initMerged.forEach((v, k) => merged.set(k, v))
+        applyExtraHeaders(merged, extra)
+        if (isGlobalRequest && init?.headers === undefined) {
+          // No init override: keep a single header set on the rebuilt Request.
+          const rebuilt = (proxiedInput as unknown as { headers: Headers }).headers
+          merged.forEach((v, k) => { if (!rebuilt.has(k)) rebuilt.set(k, v) })
+        } else {
+          ;(nextInit as unknown as Record<string, unknown>).headers = merged
+        }
+      }
       return await (undiciFetch as unknown as FetchFn)(
         proxiedInput as unknown as Request,
         nextInit as unknown as RequestInit,
       )
     } catch (err) {
-      // Sync failures only (bad proxy URL scheme / missing socks dep);
-      // async transport errors propagate to the adapter untouched.
-      // Log the full cause chain so "Connection error" isn't opaque — with a
-      // REDACTED proxyUrl: credentials must never reach logs.
+      // Log synchronous setup failures with a redacted proxy URL.
       const causeChain: string[] = []
       let c: unknown = err
       while (c && causeChain.length < 6) {
@@ -120,8 +203,7 @@ export function installFetchWrapper(log: FetchWrapLogger = consoleLogger): () =>
   globalThis.fetch = wrapped as unknown as typeof globalThis.fetch
 
   return () => {
-    // Only unwrap when we are still the outermost wrapper; otherwise another
-    // (newer) wrapper sits on top and owns the restore.
+    // Restore only when this wrapper is still outermost.
     if (globalThis.fetch === (wrapped as unknown as typeof globalThis.fetch)) {
       globalThis.fetch = original as unknown as typeof globalThis.fetch
     }

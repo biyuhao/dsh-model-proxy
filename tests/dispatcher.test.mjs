@@ -54,7 +54,7 @@ test('unsupported scheme throws with a redacted message', () => {
   )
 })
 
-test('unparseable proxyUrl throws with truncated echo', () => {
+test('unparseable proxyUrl does not echo input', () => {
   assert.throws(() => getOrCreateDispatcher('not a url ::::'), /invalid proxyUrl/)
 })
 

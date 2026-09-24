@@ -1,20 +1,8 @@
-/**
- * Host plugin: dsh-plugin-model-proxy
- *
- * - Declares live Config (volatile fields) — the settings UI projects it as
- *   the `model-proxy` section; edits commit without remounting
- * - Wraps global fetch (reversible)
- * - Intercepts `llm/stream` waterfall to route per (provider, model, purpose)
- * - Composes credentialRef entries over rule proxyUrls (soft credentials dep)
- * - Probes newly configured proxies without consuming model quota
- *
- * Zero invasion: only uses public seams (Config + ctx.settings mirror writes,
- * ctx.llm waterfall, ctx.get('credentials'), global fetch dispatcher).
- */
+/** Host routing plugin: volatile settings, fetch wrapping, credentials, probes. */
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
-import { assertServiceable, resolveProxy, redactProxyUrl, type ModelProxyConfig as ConfigType, type ModelProxyConfigRef, type ProxyRule } from './config.js'
+import { assertServiceable, resolveRoute, redactProxyUrl, type ModelProxyConfig as ConfigType, type ModelProxyConfigRef, type ProxyHost, type ProxyRule } from './config.js'
 import { catalogsEqual, computeDirectoryCatalog } from './directory.js'
 import { als, installFetchWrapper, shouldWrapFetch } from './fetch-wrap.js'
 import { clearDispatcherCache, socksDependencyAvailable } from './dispatcher.js'
@@ -28,24 +16,22 @@ export { Config } from './config.js'
 const NS = 'model-proxy' as const
 
 export function apply(ctx: Context, config: ModelProxyConfigRef): void {
-  // Each field is a volatile reference the Loader commits in place; every
-  // read takes the current committed snapshot.
+  // Loader volatile fields expose the latest committed snapshot.
   const current = (): ConfigType => ({
     enabled: config.enabled.get(),
+    proxyHosts: config.proxyHosts.get(),
     rules: config.rules.get(),
+    defaultProxyHostId: config.defaultProxyHostId.get(),
     defaultProxy: config.defaultProxy.get(),
     debug: config.debug.get(),
     catalog: config.catalog.get(),
   })
 
-  // Cross-field validation the schema cannot express; a failure fails the
-  // fiber at load with the offending rule named in the diagnostics.
-  assertServiceable(current())
+  const initialConfig = current()
+  assertServiceable(initialConfig)
+  let activeConfig: ConfigType = initialConfig
 
-  // ── credentialRef resolution ────────────────────────────────────────────
-  // The credentials service resolves ASYNC while the llm/stream listener must
-  // stay SYNC. So refs are refreshed in the background on every config change
-  // and cached here; the decision path only reads this map.
+  // Credentials resolve asynchronously; routing reads the refreshed cache.
   type CredHit = { status: 'ok'; value: string } | { status: 'error'; message: string }
   const credCache = new Map<string, CredHit>()
   const warnedCredRefs = new Set<string>()
@@ -71,11 +57,40 @@ export function apply(ctx: Context, config: ModelProxyConfigRef): void {
       })
   }
 
-  /** Effective URL for a matched rule; sync — reads only the resolved cache. */
-  const effectiveRuleUrl = (r: ProxyRule): string | undefined => {
-    if (!r.proxyUrl) return undefined
+  /** Effective URL for a reusable host or a legacy inline rule; sync. */
+  const effectiveHostUrl = (host: ProxyHost): string | undefined => {
+    const url = host.proxyUrl.trim()
+    if (!url) return undefined
+    const ref = host.credentialRef?.trim() || undefined
+    if (!ref) return url
+    const hit = credCache.get(ref)
+    if (hit?.status !== 'ok') {
+      if (!warnedCredRefs.has(ref)) {
+        warnedCredRefs.add(ref)
+        const why = hit?.status === 'error' ? hit.message : 'still resolving'
+        ctx.logger.warn(
+          `[model-proxy] credential ${ref} unavailable (${why}); proxy host ${host.name} uses its inline URL until it resolves`,
+        )
+      }
+      return url
+    }
+    return composeProxyUrl(url, hit.value) ?? url
+  }
+
+  const effectiveRuleUrl = (r: ProxyRule, cfg: ConfigType = activeConfig): string | undefined => {
+    const hostId = r.proxyHostId?.trim()
+    if (hostId) {
+      const host = cfg.proxyHosts.find((candidate) => candidate.id === hostId)
+      if (!host) {
+        ctx.logger.warn(`[model-proxy] rule ${r.provider}/${r.model} references missing proxy host "${hostId}"; using direct mode`)
+        return undefined
+      }
+      return effectiveHostUrl(host)
+    }
+    const url = r.proxyUrl?.trim() ?? ''
+    if (!url) return undefined
     const ref = r.credentialRef?.trim() || undefined
-    if (!ref) return r.proxyUrl
+    if (!ref) return url
     const hit = credCache.get(ref)
     if (hit?.status !== 'ok') {
       if (!warnedCredRefs.has(ref)) {
@@ -85,16 +100,29 @@ export function apply(ctx: Context, config: ModelProxyConfigRef): void {
           `[model-proxy] credential ${ref} unavailable (${why}); routing ${r.provider}/${r.model} with inline proxyUrl until it resolves`,
         )
       }
-      return r.proxyUrl
+      return url
     }
-    return composeProxyUrl(r.proxyUrl, hit.value) ?? r.proxyUrl
+    return composeProxyUrl(url, hit.value) ?? url
   }
 
-  // ── dispatcher cache + socks warning lifecycle ──────────────────────────
+  const effectiveDefaultUrl = (cfg: ConfigType = activeConfig): string | undefined => {
+    const hostId = cfg.defaultProxyHostId?.trim()
+    if (hostId) {
+      const host = cfg.proxyHosts.find((candidate) => candidate.id === hostId)
+      if (!host) {
+        ctx.logger.warn(`[model-proxy] default proxy references missing proxy host "${hostId}"; using direct fallback`)
+        return undefined
+      }
+      return effectiveHostUrl(host)
+    }
+    return cfg.defaultProxy?.trim() || undefined
+  }
+
+  // Dispatcher cache and SOCKS dependency warnings.
   let activeProxyUrls = new Set<string>()
   const warnedUnusableSchemes = new Set<string>()
 
-  // ── probe scheduling (P3-a): one pass per never-probed URL, serialized ──
+  // Probe each effective URL once, serially.
   const probedUrls = new Set<string>()
   let probeChain: Promise<void> = Promise.resolve()
   const scheduleProbes = (urls: Iterable<string>): void => {
@@ -115,8 +143,7 @@ export function apply(ctx: Context, config: ModelProxyConfigRef): void {
     }
   }
 
-  // Reconcile is async (credential resolution); serialize runs and coalesce
-  // bursts of config commits into one trailing run.
+  // Coalesce async reconciliation bursts.
   let reconciling = false
   let pendingReconcile = false
   const runReconcile = async (): Promise<void> => {
@@ -126,21 +153,35 @@ export function apply(ctx: Context, config: ModelProxyConfigRef): void {
     }
     reconciling = true
     try {
-      const cfg = current()
+      const cfg = activeConfig
 
-      // refresh every referenced credential before computing effective URLs
+      // Refresh credentials for routes that can actually be selected.
+      const enabledRules = cfg.rules.filter((rule) => rule.enabled !== false)
+      const reachableHostIds = new Set(
+        enabledRules.map((rule) => rule.proxyHostId?.trim()).filter((id): id is string => !!id),
+      )
+      const defaultHostId = cfg.defaultProxyHostId?.trim()
+      if (defaultHostId) reachableHostIds.add(defaultHostId)
       const lookup = getCredentialsService(ctx)
-      const refs = [...new Set(cfg.rules.map((r) => r.credentialRef?.trim()).filter((v): v is string => !!v))]
-      await Promise.all(refs.map((ref) => refreshCredential(lookup, ref)))
+      const refs = [
+        ...cfg.proxyHosts.filter((host) => reachableHostIds.has(host.id)).map((host) => host.credentialRef?.trim()),
+        ...enabledRules.map((rule) => rule.credentialRef?.trim()),
+      ].filter((v): v is string => !!v)
+      await Promise.all([...new Set(refs)].map((ref) => refreshCredential(lookup, ref)))
 
-      // eviction baseline must use EFFECTIVE urls: the dispatcher cache keys
-      // on composed URLs, so a rotated credential must retire the old pool
+      // Cache and probe only enabled, reachable routes.
       const next = new Set<string>()
-      for (const r of cfg.rules) {
-        const u = effectiveRuleUrl(r)
-        if (u) next.add(u)
+      for (const host of cfg.proxyHosts) {
+        if (!reachableHostIds.has(host.id)) continue
+        const url = effectiveHostUrl(host)
+        if (url) next.add(url)
       }
-      if (cfg.defaultProxy) next.add(cfg.defaultProxy)
+      for (const rule of enabledRules) {
+        const url = effectiveRuleUrl(rule, cfg)
+        if (url) next.add(url)
+      }
+      const fallback = effectiveDefaultUrl(cfg)
+      if (fallback) next.add(fallback)
 
       for (const url of activeProxyUrls) {
         if (!next.has(url)) clearDispatcherCache(url)
@@ -167,13 +208,11 @@ export function apply(ctx: Context, config: ModelProxyConfigRef): void {
     void runReconcile()
   }
 
-  // ── fetch wrapper lifecycle ─────────────────────────────────────────────
-  // The wrapper exists exactly while shouldWrapFetch(config) holds — disabled
-  // or fully direct configs keep the global untouched; the disposer unwinds.
+  // Keep the global fetch wrapper in sync with the active config.
   let uninstallFetch: (() => void) | undefined
   const fetchLogger = { error: (msg: string) => ctx.logger.error(msg) }
   const syncFetchWrapper = (): void => {
-    if (shouldWrapFetch(current())) {
+    if (shouldWrapFetch(activeConfig)) {
       if (!uninstallFetch) {
         uninstallFetch = installFetchWrapper(fetchLogger)
         ctx.logger.info('[model-proxy] fetch wrapper installed')
@@ -198,44 +237,52 @@ export function apply(ctx: Context, config: ModelProxyConfigRef): void {
     }
   }, 'model-proxy: fetch wrapper')
 
-  // Dispatcher pools must not outlive the plugin fiber: on unload/HMR reload
-  // the reconcile loop stops running, so a full close-and-evict here is the
-  // only guarantee the sockets are retired.
+  // Close dispatcher pools when the plugin fiber unloads.
   ctx.effect(() => () => {
     const n = clearDispatcherCache()
     if (n > 0) ctx.logger.info(`[model-proxy] closed ${n} dispatcher pool(s)`)
   }, 'model-proxy: dispatcher cache')
 
-  // 1) Volatile config commits — re-derive every side effect the initial
-  // config seeded. Registered AFTER the effects above so the first commit
-  // cannot touch a not-yet-initialized binding.
+  // Apply validated volatile config updates.
   ctx.on('loader/volatile-update', () => {
-    syncFetchWrapper()
+    const next = current()
     try {
-      assertServiceable(current())
+      assertServiceable(next)
+      activeConfig = next
     } catch (err) {
-      // Already committed — warn and keep serving; failing here would hide
-      // the card entirely.
+      activeConfig = {
+        ...next,
+        enabled: false,
+        proxyHosts: [],
+        rules: [],
+        defaultProxyHostId: '',
+        defaultProxy: '',
+        debug: false,
+      }
       ctx.logger.warn(err)
     }
+    syncFetchWrapper()
     reconcileConfigSideEffects()
-    const cfg = current()
+    const cfg = activeConfig
     if (!cfg.debug) return
     const summary = cfg.rules
-      .map((r) => `${r.provider}/${r.model}→${r.proxyUrl ? redactProxyUrl(r.proxyUrl) : 'direct'}${r.purpose ? `@${r.purpose}` : ''}`)
+      .map((r) => {
+        const names = r.headers ? Object.keys(r.headers).join(',') : ''
+        const target = r.proxyHostId
+          ? `host:${r.proxyHostId}`
+          : r.proxyUrl
+            ? redactProxyUrl(r.proxyUrl)
+            : 'direct'
+        return `${r.provider}/${r.model}→${target}${r.purpose ? `@${r.purpose}` : ''}${names ? ` headers:[${names}]` : ''}`
+      })
       .join(', ')
+    const fallback = effectiveDefaultUrl(cfg)
     ctx.logger.info(
-      `[model-proxy] config applied: enabled=${cfg.enabled} rules=${cfg.rules.length}${summary ? ` [${summary}]` : ''} defaultProxy=${cfg.defaultProxy ? redactProxyUrl(cfg.defaultProxy) : 'direct'}`,
+      `[model-proxy] config applied: enabled=${cfg.enabled} rules=${cfg.rules.length}${summary ? ` [${summary}]` : ''} defaultProxy=${fallback ? redactProxyUrl(fallback) : 'direct'}`,
     )
   })
 
-  // 2) Directory mirror — host-computed provider/model catalog persisted into
-  // our own namespace so cards on pages without the cross-namespace Typert
-  // remotes (`remote.llm` etc., e.g. non-loopback pages) still render
-  // dropdowns. Burst-safe via mirrorChain; the deep-equal guard breaks the
-  // self-triggered write loop (our update re-fires settings/document-updated).
-  // Ids/display names only, never credentials. dsh-settings is accessed
-  // structurally: describe() feeds the computation, update() persists.
+  // Mirror provider/model metadata for pages without Typert remotes.
   type SettingsFace = {
     describe?: () => Array<{ ns?: unknown; value?: unknown }>
     update?: (ns: string, patch: Record<string, unknown>) => Promise<unknown>
@@ -272,38 +319,52 @@ export function apply(ctx: Context, config: ModelProxyConfigRef): void {
     refreshDirectoryMirror()
   })
 
-  // Kick initial reconciliation (credential cache warmup, first probes); the
-  // fetch wrapper was already synced by its effect. Fire-and-forget: failures
-  // are logged inside.
+  // Warm credentials and schedule initial probes.
   reconcileConfigSideEffects()
 
-  // 3) llm/stream waterfall — per-request proxy decision
-  //    We use waterfall mode: decide, stash in ALS, then delegate.
-  //    The listener must be SYNC and return an AsyncIterable: cordis waterfall
-  //    composition does not await listener results, and downstream listeners
-  //    (e.g. session-checkpoint-policy) `yield* next()` — an `async` listener
-  //    hands them a Promise and iteration throws "not async iterable".
+  // llm/stream must stay synchronous and return an AsyncIterable.
   ctx.on('llm/stream', (opts: GenerateOptions, next: () => AsyncIterable<unknown>): AsyncIterable<unknown> => {
-    const cfg = current()
-    const proxyUrl = resolveProxy(cfg, opts.provider, opts.model, opts.purpose, effectiveRuleUrl)
+    const cfg = activeConfig
+    const fallback = effectiveDefaultUrl(cfg)
+    const route = resolveRoute(
+      { ...cfg, defaultProxy: fallback ?? '' },
+      opts.provider,
+      opts.model,
+      opts.purpose,
+      (rule) => effectiveRuleUrl(rule, cfg),
+      {
+        sessionId: opts.sessionId,
+        provider: opts.provider,
+        model: opts.model,
+        purpose: opts.purpose,
+      },
+    )
+    const proxyUrl = route.proxyUrl
+    const headers = route.headers
     const label = `${opts.provider}/${opts.model}${opts.purpose ? `@${opts.purpose}` : ''}`
 
     // Routing decision is logged only when the user asked for debug output,
-    // and always redacted.
+    // and always redacted: proxy passwords never appear, header VALUES never
+    // appear (names only — values may carry session secrets).
     if (cfg.debug) {
-      ctx.logger.info(`[model-proxy] ${label} → ${proxyUrl ? redactProxyUrl(proxyUrl) : 'direct'}`)
+      const headerNames = headers ? Object.keys(headers).join(',') : ''
+      ctx.logger.info(`[model-proxy] ${label} → ${proxyUrl ? redactProxyUrl(proxyUrl) : 'direct'}${headerNames ? ` headers:[${headerNames}]` : ''}`)
     }
 
-    // Fast path: globally disabled, nothing configured, or no match — pass
-    // through untouched without entering the ALS context.
-    if (!proxyUrl) return next() as AsyncIterable<never>
+    // Fast path: globally disabled, nothing configured, or no match without
+    // headers — pass through untouched without entering the ALS context. A
+    // direct rule WITH headers still enters it so the fetch wrapper can merge
+    // those headers into the ordinary global fetch.
+    if (!proxyUrl && !headers) return next() as AsyncIterable<never>
 
-    // AsyncLocalStorage does NOT propagate into a deferred async generator:
-    // the consumer resumes it from its own context, so a store set here would
-    // be gone by the time the adapter's fetch runs. Instead we re-enter the
-    // store per protocol call (next/return/throw), which keeps it alive across
-    // every await inside the adapter's stream.
-    const ctxData = { proxyUrl, provider: opts.provider, model: opts.model }
+    // Re-enter ALS for each iterator operation; async generators resume outside
+    // the listener's original context.
+    const ctxData = {
+      ...(proxyUrl ? { proxyUrl } : {}),
+      provider: opts.provider,
+      model: opts.model,
+      ...(headers ? { headers } : {}),
+    }
     const iterator = (next() as AsyncIterable<unknown>)[Symbol.asyncIterator]()
     return {
       [Symbol.asyncIterator]() {

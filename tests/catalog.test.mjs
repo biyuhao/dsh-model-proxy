@@ -431,6 +431,23 @@ test('store prefers the Typert face and joins live routes with the directory', a
   store.dispose()
 })
 
+test('throwing reduced remote namespaces fall back to legacy faces', async () => {
+  const backend = fakeBackend({
+    providers: { providers: [{ id: 'legacy', name: 'Legacy' }] },
+    models: { groups: [], failures: [] },
+  })
+  const remote = {
+    $on: () => () => {},
+    get llm() { throw new Error('not injected') },
+    get settings() { throw new Error('not injected') },
+    get session() { throw new Error('not injected') },
+  }
+  const store = await settledStore(backend, remote)
+  assert.equal(store.getSnapshot().status, 'ready')
+  assert.deepEqual(store.getSnapshot().providers.map((p) => p.provider), ['legacy'])
+  store.dispose()
+})
+
 test('Typert business rejection on both faces marks unavailable, legacy untouched', async () => {
   const backend = fakeBackend({ models: { groups: [], failures: [] } })
   const ty = fakeTypertRemote({ registeredError: 'llm down', directoryError: 'llm down' })

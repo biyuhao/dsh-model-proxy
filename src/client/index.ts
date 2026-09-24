@@ -15,7 +15,6 @@ import { en, zh } from './locales.js'
 export const inject = ['slots', 'locale', 'connection', 'remote', 'configForms']
 
 export function apply(ctx: ClientContext): void {
-  const t = ctx.locale.bind('settings.modelProxy' as never)
   ctx.effect(() => ctx.locale.register('settings.modelProxy' as never, { en, zh } as never), 'model-proxy: locale')
 
   const scope = ctx.configForms.get('model-proxy')
@@ -26,16 +25,7 @@ export function apply(ctx: ClientContext): void {
     return () => ctrl.dispose()
   }, 'model-proxy: scope bind')
 
-  // Live provider/model catalog for the card dropdowns (llm.providers /
-  // llm.models, refreshed on llm/adapters-updated + settings/document-updated).
-  //
-  // NOTE: the static inject list intentionally stays on the always-mounted
-  // faces (slots/locale/connection/remote/configForms). The llm/settings/
-  // session Typert namespaces are resolved dynamically per load() inside the
-  // store: hard-requiring them here would keep the whole card (including its
-  // configForms-backed editing) pending on pages whose gateway mounts a
-  // reduced remote surface, turning a degradable catalog miss into a missing
-  // card.
+  // Live provider/model catalog; the store degrades when Typert remotes are absent.
   const cctx = ctx as never as { connection: { api: unknown }; remote: unknown }
   const catalog = new ProviderCatalogStore(
     cctx.connection.api as never,
@@ -72,14 +62,4 @@ export function apply(ctx: ClientContext): void {
     ),
   )), 'model-proxy: config page')
 
-  // Also support direct section registration if user prefers a top-level section.
-  // Uncomment to get a dedicated nav entry instead of Plugins tab card:
-  // ctx.slots.inject('settings.section', () => ctx.slots.register({
-  //   name: 'settings.section',
-  //   id: 'model-proxy',
-  //   order: 20,
-  //   label: () => (t as (k:string)=>string)('nav'),
-  //   locale: 'settings.modelProxy' as never,
-  //   inject: () => ({ controller: ctrl }),
-  // } as never, ModelProxyCard as never))
 }

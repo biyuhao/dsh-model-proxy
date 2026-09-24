@@ -119,6 +119,12 @@ test('shouldWrapFetch: global fetch is only wrapped while routing is possible', 
   assert.equal(shouldWrapFetch({ enabled: true, defaultProxy: 'http://127.0.0.1:7890', rules: [] }), true)
   // any live rule with a URL
   assert.equal(shouldWrapFetch({ enabled: true, rules: [{ proxyUrl: 'socks5://127.0.0.1:1080' }] }), true)
+  // direct rules with headers still need the wrapper
+  assert.equal(shouldWrapFetch({ enabled: true, rules: [{ proxyUrl: '', headers: { 'x-test': '1' } }] }), true)
+  // dynamic session headers also justify the wrapper
+  assert.equal(shouldWrapFetch({ enabled: true, rules: [{ proxyUrl: '', headerValueSources: { 'x-session': 'sessionId' } }] }), true)
+  // reusable host references also justify the wrapper
+  assert.equal(shouldWrapFetch({ enabled: true, proxyHosts: [{ id: 'h', proxyUrl: 'socks5://h:1080' }], rules: [{ proxyHostId: 'h' }] }), true)
   // disabled rules do not count
   assert.equal(shouldWrapFetch({ enabled: true, rules: [{ proxyUrl: 'http://h:1', enabled: false }] }), false)
 })

@@ -49,13 +49,13 @@
 
 | ID | 需求 | 优先级 |
 |---|---|---|
-| F1 | **按规则代理**：`(provider, model)` → `proxyUrl`；支持通配 `model="*"`、按顺序最精确匹配 | P0 |
+| F1 | **按规则代理**：`(provider, model)` → `proxyHostId`；支持通配 `model="*"`、按顺序最精确匹配 | P0 |
 | F2 | **多协议**：`http://` / `https://`（CONNECT）、`socks5://` / `socks5h://`；带用户名密码的 URL | P0 |
 | F3 | **零 baseURL 篡改**：上游 baseURL 保持真实值，代理在传输层解决，不改 DSH 配置中的 endpoint | P0 |
 | F4 | **零手动守护进程**：随 DSH 插件生命周期自动起停，不额外占端口（除非配置本地转发模式） | P0 |
 | F5 | **即时生效**：改规则无需重启 DSH，下一条 `llm/stream` 即生效；进行中的流不受影响 | P0 |
 | F6 | **范围控制**：支持同时配置多条规则，多 provider/多模型独立 | P0 |
-| F7 | **显式禁用**：`proxyUrl=""` / `enabled:false` 表示直连，用于在全局代理下对某模型豁免 | P1 |
+| F7 | **显式直连**：规则缺省 `proxyHostId` / 选择 Direct 表示不使用代理；`enabled:false` 表示停用规则 | P1 |
 | F8 | **可观测**：日志与 `providerRetryAfter` / `requestId` 透传；可选 debug 日志哪条请求走了哪个代理 | P1 |
 | F9 | **GUI/文件配置**：settings 页面可视化编辑；volatile Config 字段即 profile patch 中该 entry 的 `config`，手写同样生效且热更新 | P1 |
 | F10 | **测试旁路**：提供 `probe` 能力（类似“检测连接”）不发真实模型请求即可校验代理可达 | P2 |
@@ -71,7 +71,7 @@
 ### 2.3 非目标
 
 * 不做全局系统代理管理器（不改 OS 代理、不写 PAC）。
-* 不做请求内容改写（不改 headers/body，仅传输层代理）。
+* 不做请求内容改写（不改 body；headers 仅允许规则配置的固定值或当前 Session ID，且已存在的同名 Header 优先，`Authorization` 类禁用）。
 * 首版不做“按工具/按 session”代理（可扩展点预留）。
 
 ---
@@ -99,8 +99,9 @@
 ```mermaid
 flowchart LR
   subgraph Settings["Settings (model-proxy)"]
-    Rules["proxyRules[]\n{provider, model, proxyUrl, enabled}"]
-    Defaults["defaultProxy?"]
+    Rules["proxyRules[]\n{provider, model, proxyHostId, enabled}"]
+    Hosts["proxyHosts[]\n{id, name, proxyUrl, credentialRef}"]
+    Defaults["defaultProxyHostId?"]
   end
 
   subgraph LLM["LLM 调用链"]
@@ -117,6 +118,7 @@ flowchart LR
     Direct["直连"]
   end
 
+  Hosts --> Waterfall
   Rules --> Waterfall
   Defaults --> Waterfall
   AgentLoop --> Waterfall --> AdapterDeepseek & AdapterPiAi
@@ -131,8 +133,8 @@ flowchart LR
 用户 prompt
   → agent-loop 组装 GenerateOptions{provider="opencode", model="muse-spark-1.2-contributor", ...}
   → ctx.waterfall('llm/stream', options, next)
-      ① 插件 listener：resolveProxy(options) → {proxyUrl:"socks5://127.0.0.1:1080", ruleId}
-         存入 ALS: {proxyUrl, provider, model}
+      ① 插件 listener：resolveRoute(options) → {proxyUrl:"socks5://127.0.0.1:1080", headers}
+         存入 ALS: {proxyUrl?, provider, model, headers?}
          调用 next() 进入适配器
   → DeepSeekAdapter / PiAiAdapter 内部 fetch("https://upstream.example.com/v1/chat/completions", {signal, headers, body})
   → 被包装的 global fetch 拦截：
@@ -170,36 +172,49 @@ flowchart LR
 
 ```ts
 // packages/model-proxy/src/config.ts
+export interface ProxyHost {
+  id: string
+  name: string
+  proxyUrl: string
+  credentialRef?: string
+}
+
 export interface ProxyRule {
   /** Provider 路由，如 "opencode"、"deepseek-official"、"acme-gateway" */
   provider: string
   /** 模型 id：精确值 | 前缀通配 "muse-*" | 全通配 "*" */
-  model: string              // "*" | "muse-*" | "muse-spark-1.2-contributor"
-  /** 代理 URL，空字符串表示直连（豁免） */
-  proxyUrl: string           // "socks5://127.0.0.1:1080" | "http://127.0.0.1:7890" | ""
-  /** 是否启用；false 等同直连但保留 URL 供一键再启用 */
-  enabled?: boolean          // default true
-  /** UI 卡片键；手写 yaml 规则可省略，客户端负责补齐 */
+  model: string
+  /** 引用 proxyHosts；缺省表示直连 */
+  proxyHostId?: string
+  /** 旧版内联 URL，保留兼容；新 UI 会在保存时迁移到 proxyHosts */
+  proxyUrl?: string
+  enabled?: boolean
   id?: string
-  /** 可选用途过滤：设置后仅匹配 GenerateOptions.purpose 相同的调用 */
   purpose?: string
-  /** credentials 服务条目名（user:password），设置后覆盖 proxyUrl 内联 userinfo */
+  /** 旧版逐规则凭据引用；新 UI 将凭据放到 ProxyHost */
   credentialRef?: string
+  /** 固定附加 Header；直连和代理模式都会发送 */
+  headers?: Record<string, string>
+  /** Header 值来源；从当前 GenerateOptions 请求上下文读取 */
+  headerValueSources?: Record<string, 'fixed' | 'sessionId' | 'provider' | 'model' | 'purpose'>
 }
 
 export interface ModelProxyConfig {
-  /** 按序匹配；首个命中即用；建议 UI 按 provider 分组展示 */
+  proxyHosts: ProxyHost[]
   rules: ProxyRule[]
-  /** 可选默认兜底代理；无匹配时使用 */
-  defaultProxy?: string      // "" 为直连
-  /** 调试：为每次请求打印 [model-proxy] provider/model → proxy */
+  defaultProxyHostId?: string
+  /** 旧版内联兜底 URL；新 UI 使用 defaultProxyHostId */
+  defaultProxy?: string
   debug?: boolean
 }
 ```
 
 校验（`assertServiceable`）：
 
-* `provider` 非空；`model` 非空；`proxyUrl` 为空或可被 `new URL()` 解析且 scheme ∈ {`http:`,`https:`,`socks5:`,`socks5h:`}；`socks5h` 表示远端 DNS。
+* `provider` 非空；`model` 非空；`proxyHostId` 必须引用已存在的 `proxyHosts` 条目，缺省表示直连。
+* `proxyHosts` 至少包含唯一 `id`、非空 `name` 和可解析的 `proxyUrl`；凭据引用只保存服务条目名。
+* 旧规则的内联 `proxyUrl` / `credentialRef` 仍可路由，并由客户端在首次保存时迁移为命名主机。
+* `headers` 可选：`Name: value` 固定值映射；`headerValueSources` 可将指定 Header 改为 `sessionId`、`provider`、`model` 或 `purpose`，运行时从当前请求上下文填充。头名须为合法 HTTP token（`Authorization` / `Proxy-Authorization` 禁止），固定值非空、无首尾空格、无 CR/LF，最多 10 项；直连和代理规则都会发送。缺少对应上下文字段时不注入动态 Header。
 * 重复 `provider+model` 拒绝并指明行号。
 * `socks5://` 需可选依赖可用，否则校验阶段给 warning（不硬拒绝，运行时再 `LlmError` 提示安装 `socks`）。
 
@@ -208,16 +223,25 @@ export interface ModelProxyConfig {
 ```yaml
 - id: model-proxy
   config:
+    proxyHosts:
+      - id: local-socks
+        name: Local SOCKS
+        proxyUrl: socks5://127.0.0.1:1080
+    defaultProxyHostId: local-socks
     rules:
       - provider: opencode
         model: muse-spark-1.2-contributor
-        proxyUrl: socks5://127.0.0.1:1080
+        proxyHostId: local-socks
       - provider: opencode
         model: "*"
-        proxyUrl: ""           # 该 provider 其余模型直连
+        # 缺省 proxyHostId = 直连
       - provider: acme-gateway
         model: "*"
-        proxyUrl: http://127.0.0.1:7890
+        proxyHostId: local-socks
+        headerValueSources:
+          x-opencode-session: sessionId
+          x-model-name: model
+          x-request-purpose: purpose
     debug: false
 ```
 
@@ -226,19 +250,16 @@ settings UI 的编辑也写回同一行，两种途径共享一份持久化。
 ### 6.2 路由匹配
 
 ```ts
-function resolveProxy(
-  rules: readonly ProxyRule[],
-  defaultProxy: string | undefined,
+function resolveRoute(
+  config: ModelProxyConfig,
   provider: string,
   model: string,
-): string | undefined {
-  for (const r of rules) {
-    if (!r.enabled === false && r.provider === provider
-        && (r.model === model || r.model === "*")) {
-      return r.proxyUrl || undefined  // "" → 直连
-    }
-  }
-  return defaultProxy || undefined
+  resolveHostUrl: (rule: ProxyRule) => string | undefined,
+  sessionId?: string,
+): { proxyUrl?: string; headers?: Record<string, string> } {
+  // exact > prefix > wildcard; the first matching rule wins.
+  // resolveHostUrl returns undefined for a Direct rule, while headers remain.
+  // ...
 }
 ```
 
@@ -251,14 +272,13 @@ function resolveProxy(
 
 ```ts
 import { AsyncLocalStorage } from 'node:async_hooks'
-type ProxyCtx = { proxyUrl?: string; provider: string; model: string }
+type ProxyCtx = { proxyUrl?: string; provider: string; model: string; headers?: Record<string, string> }
 const als = new AsyncLocalStorage<ProxyCtx>()
 
 // waterfall listener
-ctx.on('llm/stream', async (options: GenerateOptions, next) => {
-  const proxyUrl = resolveProxy(currentRules, defaultProxy, options.provider, options.model)
-  return als.run({ proxyUrl, provider: options.provider, model: options.model },
-    () => next())
+ctx.on('llm/stream', (options: GenerateOptions, next) => {
+  const route = resolveRoute(currentConfig, options.provider, options.model, resolveHostUrl)
+  return als.run({ ...route, provider: options.provider, model: options.model }, () => next())
 })
 ```
 
@@ -274,14 +294,12 @@ const originalFetch = globalThis.fetch.bind(globalThis)
 
 globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit & { dispatcher?: unknown }) => {
   const store = als.getStore()
-  if (!store?.proxyUrl) return originalFetch(input as any, init as any)
-
-  // 仅拦截模型上游请求：可通过 URL 白名单或“处于 ALS 上下文即拦截”两种策略
-  // 策略1最稳：只要在 llm/stream 上下文里，就走代理（避免误代理其他 fetch）
+  if (!store) return originalFetch(input as any, init as any)
+  if (!store.proxyUrl) {
+    // Direct mode still merges resolved rule headers into native fetch.
+    return originalFetch(input as any, mergeDirectHeaders(init, store.headers))
+  }
   const dispatcher = getOrCreateDispatcher(store.proxyUrl)
-  // 注意：Node 原生全局 fetch 不认自定义 dispatcher（连 undici.ProxyAgent 都拒，
-  // 报 "invalid onError method"），因此命中代理时必须改走 undici 自身的 fetch，
-  // 它才完整支持 `dispatcher`（含下方 socks Agent）。直连仍走 originalFetch，行为不变。
   return undiciFetch(input as any, { ...init, dispatcher } as any)
 }
 ```
@@ -448,10 +466,10 @@ export function apply(ctx: Context, config: unknown) {
   })
 
   // 3. llm/stream 路由决策
-  ctx.on('llm/stream', async (opts, next) => {
-    const proxyUrl = resolveProxy(rules.value.rules, rules.value.defaultProxy, opts.provider, opts.model)
-    if (rules.value.debug) ctx.logger.info(`[model-proxy] ${opts.provider}/${opts.model} → ${proxyUrl ?? 'direct'}`)
-    return als.run({ proxyUrl, provider: opts.provider, model: opts.model }, () => next())
+  ctx.on('llm/stream', (opts, next) => {
+    const route = resolveRoute(rules.value, opts.provider, opts.model, resolveHostUrl)
+    if (rules.value.debug) ctx.logger.info(`[model-proxy] ${opts.provider}/${opts.model} → ${route.proxyUrl ?? 'direct'}`)
+    return als.run({ ...route, provider: opts.provider, model: opts.model }, () => next())
   })
 
   // 4. 可选 probe 能力：注册为 ctx.commands 或 host API
@@ -459,10 +477,11 @@ export function apply(ctx: Context, config: unknown) {
 }
 ```
 
-### 7.2 Client 插件（可选首版）
+### 7.2 Client 插件
 
-* 在 `ui-settings-models` 旁新增一个 `ui-settings` 的 section，或在现有 provider 卡片上加一个“代理”下拉。
-* 简化首版：**仅 host 插件 + 手写 settings**，二期再补 GUI。
+* 在 `ui-settings-models` 旁提供 Model Proxy card。
+* 规则区只编辑 provider/model、用途、Header 和代理主机下拉；下方统一管理可复用主机档案。
+* 下拉中的 Direct 跳过 dispatcher，但仍把该规则 Header 合并到原生 fetch。
 
 ---
 

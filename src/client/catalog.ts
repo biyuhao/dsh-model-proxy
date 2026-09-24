@@ -465,12 +465,29 @@ export class ProviderCatalogStore {
         () => ({ ok: false as const }),
       )
     const remoteAny = this.remote as unknown as Record<string, unknown> | undefined
-    const remoteLlm = (remoteAny?.llm ?? undefined) as Record<string, unknown> | undefined
-    const remoteSettings = (remoteAny?.settings ?? undefined) as Record<string, unknown> | undefined
-    const remoteSession = (remoteAny?.session ?? undefined) as Record<string, unknown> | undefined
-    const hasTypertProviders =
-      remoteLlm !== undefined &&
-      (typeof remoteLlm.listProviders === 'function' || typeof remoteLlm.listConfigurableProviders === 'function')
+    // Reduced DSH remotes may throw while resolving namespaces or methods.
+    const pickNs = (name: string): Record<string, unknown> | undefined => {
+      try {
+        const v = remoteAny?.[name] ?? undefined
+        return (typeof v === 'object' && v !== null ? v : undefined) as Record<string, unknown> | undefined
+      } catch {
+        return undefined
+      }
+    }
+    const remoteLlm = pickNs('llm')
+    const remoteSettings = pickNs('settings')
+    const remoteSession = pickNs('session')
+    const pickMethod = (ns: Record<string, unknown> | undefined, name: string): (() => Promise<unknown>) | undefined => {
+      try {
+        const method = ns?.[name]
+        return typeof method === 'function' ? (method as () => Promise<unknown>).bind(ns) : undefined
+      } catch {
+        return undefined
+      }
+    }
+    const listProviders = pickMethod(remoteLlm, 'listProviders')
+    const listConfigurableProviders = pickMethod(remoteLlm, 'listConfigurableProviders')
+    const hasTypertProviders = listProviders !== undefined || listConfigurableProviders !== undefined
 
     const providersPromise = (async (): Promise<unknown> => {
       if (hasTypertProviders) {
@@ -478,12 +495,8 @@ export class ProviderCatalogStore {
         // A carrier rejection on one side degrades to the other side instead
         // of failing the whole load — the dropdown needs rows, not both.
         const [registeredOutcome, directoryOutcome] = await Promise.all([
-          typeof remoteLlm!.listProviders === 'function'
-            ? settle((remoteLlm!.listProviders as () => Promise<unknown>)())
-            : Promise.resolve({ ok: false as const }),
-          typeof remoteLlm!.listConfigurableProviders === 'function'
-            ? settle((remoteLlm!.listConfigurableProviders as () => Promise<unknown>)())
-            : Promise.resolve({ ok: false as const }),
+          listProviders ? settle(listProviders()) : Promise.resolve({ ok: false as const }),
+          listConfigurableProviders ? settle(listConfigurableProviders()) : Promise.resolve({ ok: false as const }),
         ])
         // A business rejection ({ok:false} envelope) throws here with the
         // wire message; a carrier rejection was already folded to {ok:false}
@@ -514,9 +527,9 @@ export class ProviderCatalogStore {
       // llm.models, served by the Plugins-tab-native face — reachable on
       // pages where the legacy RPC never existed.
       try {
-        const modelCatalog = remoteSession?.modelCatalog
-        if (typeof modelCatalog !== 'function') throw new Error('no session catalog face')
-        return unwrapRemoteResult(await (modelCatalog as () => Promise<unknown>)())
+        const modelCatalog = pickMethod(remoteSession, 'modelCatalog')
+        if (!modelCatalog) throw new Error('no session catalog face')
+        return unwrapRemoteResult(await modelCatalog())
       } catch {}
       // No Typert bulk models API (0.1.2 serves per-namespace discoverModels);
       // the settings.describe synthesis below covers the dropdown instead.
@@ -524,10 +537,10 @@ export class ProviderCatalogStore {
     })()
 
     const settingsPromise = (async (): Promise<unknown> => {
-      if (remoteSettings !== undefined && typeof remoteSettings.describe === 'function') {
+      const describe = pickMethod(remoteSettings, 'describe')
+      if (describe) {
         // Typert face: RemoteResult envelope, unwrap before reading namespaces.
-        const res = await (remoteSettings.describe as () => Promise<unknown>)()
-        return unwrapRemoteResult(res)
+        return unwrapRemoteResult(await describe())
       }
       if (this.api.settings?.describe !== undefined) {
         const raw = await this.api.settings.describe({})

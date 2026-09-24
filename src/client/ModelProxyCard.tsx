@@ -1,23 +1,12 @@
-import { useCallback, useEffect, useId, useMemo, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { CSSProperties } from 'react'
 import type { CatalogProvider, CatalogSnapshot, DirectoryMirror } from './catalog.js'
 import { ProviderCatalogStore, mirrorModelsToMap } from './catalog.js'
-import type { ModelProxyController, ModelProxyConfig, ProxyRule } from './controller.js'
-import { buildCreatorRules, ensureRuleIds, groupByProvider, makeRuleId } from './controller.js'
+import type { HeaderEditorRow, HeaderValueSource, HeaderSources, ModelProxyController, ModelProxyConfig, ProxyHost, ProxyRule } from './controller.js'
+import { buildCreatorRules, ensureRuleIds, groupByProvider, makeProxyHostId, makeRuleId, normalizeConfig, parseHeaderRows } from './controller.js'
 import { en } from './locales.js'
 
-// ---------------------------------------------------------------------------
-// Design-system alignment for DSH 0.1.2-alpha.3
-// ---------------------------------------------------------------------------
-// DSH switched from ad-hoc #ccc/#ddd borders to the DSW alias tokens
-// (var(--dsw-alias-border-l2) etc). Native <select>/<input> without the
-// token classes now looks "失效" — wrong background/border in dark mode and
-// missing custom dropdown arrow. Mirror the token-based styling used by
-// ui-settings-models (Be6O7G_input / Be6O7G_selectInput) and
-// ui-settings-plugins (fields.module.css) so the card feels native.
-//
-// We inject a single <style> tag keyed by plugin id, like DSH's own
-// css modules do (query by data-plugin-css to stay idempotent across HMR).
+// DSH settings controls use DSW alias tokens; keep native inputs consistent.
 const MP_CSS = `
 .mp_input,.mp_select{
   box-sizing:border-box;
@@ -129,22 +118,16 @@ const NO_CATALOG: CatalogSnapshot = { status: 'idle', providers: [], modelsByPro
 
 /** Sentinel <option> that flips a field into free-text mode (never stored). */
 const CUSTOM_SENTINEL = '__custom__'
+/** Built-in direct route: no proxy dispatcher, but rule headers still apply. */
+const DIRECT_PROXY_SENTINEL = '__direct__'
 
 type FieldOption = { value: string; label: string }
 
 /** Rendered shape of one <optgroup>; label undefined renders a flat list. */
 type FieldGroup = { label?: string; options: FieldOption[] }
 
-/**
- * One rule field rendered as a dropdown over catalog options with a
- * "Custom…" escape hatch into free text.
- *
- * Mode is derived, not synced: an existing value absent from the options
- * (hand-written yaml rule, wildcard pattern) opens in custom mode; picking
- * the sentinel option enters custom mode without touching the value; the
- * ▾ button returns to the list. When no options exist at all (catalog
- * unloaded/unavailable/empty) only the text input renders.
- */
+/** Catalog picker with a free-text escape hatch. */
+
 function CatalogField(props: {
   value: string
   groups: FieldGroup[]
@@ -244,10 +227,7 @@ const PROXY_PRESETS = [
   'http://127.0.0.1:8080',
 ]
 
-/**
- * Merge the user's own in-use URLs ahead of the built-in presets, deduped.
- * Own URLs first: the ghost prefers what this config already uses.
- */
+/** Prefer configured URLs, then built-in presets. */
 function mergeProxySuggestions(used: readonly string[]): string[] {
   const out: string[] = []
   const seen = new Set<string>()
@@ -260,15 +240,8 @@ function mergeProxySuggestions(used: readonly string[]): string[] {
   return out
 }
 
-/**
- * Proxy URL field with inline ghost completion.
- *
- * The grey example text no longer vanishes on first keystroke: while the
- * typed value is a (case-insensitive) prefix of a known candidate, the
- * remainder stays rendered in dimmed grey behind the caret. Tab (or → at
- * end of input) accepts it; a native datalist keeps every candidate
- * one click away.
- */
+/** Proxy URL input with ghost completion and a datalist. */
+
 function ProxyUrlInput(props: {
   value: string
   onChange: (value: string) => void
@@ -331,7 +304,268 @@ function ProxyUrlInput(props: {
   )
 }
 
+function proxyHostLabel(host: ProxyHost): string {
+  let shown = host.proxyUrl
+  try {
+    const u = new URL(host.proxyUrl)
+    if (u.username || u.password) {
+      u.username = '***'
+      u.password = ''
+    }
+    u.search = ''
+    u.hash = ''
+    shown = u.toString()
+  } catch {
+    // Keep the user's raw value visible while they are editing an invalid URL.
+  }
+  return `${host.name || host.id} · ${shown}`
+}
+
+/** Select a reusable proxy host, with direct mode always available. */
+function HostSelect(props: {
+  value: string | undefined
+  hosts: readonly ProxyHost[]
+  onChange: (value: string) => void
+  disabled: boolean
+  t: (k: keyof typeof en) => string
+}) {
+  const { value, hosts, onChange, disabled, t } = props
+  const selected = value && value !== DIRECT_PROXY_SENTINEL ? value : DIRECT_PROXY_SENTINEL
+  const known = hosts.some((host) => host.id === selected)
+  return (
+    <select
+      className="mp_select"
+      value={selected}
+      onChange={(e) => onChange(e.target.value)}
+      disabled={disabled}
+    >
+      <option value={DIRECT_PROXY_SENTINEL}>{t('direct')}</option>
+      {hosts.map((host) => <option key={host.id} value={host.id}>{proxyHostLabel(host)}</option>)}
+      {!known && value !== undefined && value !== '' && value !== DIRECT_PROXY_SENTINEL && (
+        <option value={value}>{t('missingHost')}</option>
+      )}
+    </select>
+  )
+}
+
+/** Reusable proxy host rows. Rule cards only reference these ids. */
+function ProxyHostsEditor(props: {
+  hosts: readonly ProxyHost[]
+  usedHostIds: ReadonlySet<string>
+  suggestions: readonly string[]
+  disabled: boolean
+  t: (k: keyof typeof en) => string
+  onAdd(): void
+  onChange(id: string, patch: Partial<ProxyHost>): void
+  onRemove(id: string): void
+}) {
+  const { hosts, usedHostIds, suggestions, disabled, t, onAdd, onChange, onRemove } = props
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {hosts.length === 0 && (
+        <div style={{ opacity: 0.6, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }}>{t('hostsEmpty')}</div>
+      )}
+      {hosts.map((host) => (
+        <div key={host.id} className="mp_card" style={{ padding: 8 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr 1fr auto', gap: 8, alignItems: 'end' }}>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('hostName')}</span>
+              <input
+                value={host.name}
+                onChange={(e) => onChange(host.id, { name: e.target.value })}
+                className="mp_input"
+                disabled={disabled}
+              />
+            </label>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('proxyUrl')}</span>
+              <ProxyUrlInput
+                value={host.proxyUrl}
+                onChange={(v) => onChange(host.id, { proxyUrl: v })}
+                placeholder={t('proxyPlaceholder')}
+                disabled={disabled}
+                ghostHint={t('proxyGhostHint')}
+                suggestions={suggestions}
+              />
+            </label>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('credRef')}</span>
+              <input
+                value={host.credentialRef ?? ''}
+                onChange={(e) => onChange(host.id, { credentialRef: e.target.value })}
+                className="mp_input"
+                placeholder={t('credRefPlaceholder')}
+                disabled={disabled}
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => onRemove(host.id)}
+              disabled={disabled || usedHostIds.has(host.id)}
+              title={usedHostIds.has(host.id) ? t('hostInUse') : t('delete')}
+              className="mp_btnSecondary"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      ))}
+      <div>
+        <button type="button" onClick={onAdd} disabled={disabled} className="mp_btnSecondary">
+          {t('addHost')}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 const SHOW_UNCONFIGURED_KEY = 'dsh-model-proxy:showUnconfigured'
+
+function headersToRows(headers: Record<string, string> | undefined, sources: HeaderSources | undefined): HeaderEditorRow[] {
+  const names = [...Object.keys(headers ?? {}), ...Object.keys(sources ?? {}).filter((name) => headers?.[name] === undefined)]
+  return names.map((name) => ({
+    key: makeRuleId(),
+    name,
+    value: headers?.[name] ?? '',
+    source: sources?.[name] ?? 'fixed',
+  }))
+}
+
+function headerSpecSignature(headers: Record<string, string> | undefined, sources: HeaderSources | undefined): string {
+  return [...new Set([...Object.keys(headers ?? {}), ...Object.keys(sources ?? {})])]
+    .map((name) => `${name}\0${sources?.[name] ?? 'fixed'}\0${headers?.[name] ?? ''}`)
+    .join('\n')
+}
+
+function rowsSpecSignature(rows: readonly HeaderEditorRow[]): string {
+  const headers = Object.fromEntries(
+    rows.filter((row) => row.source === 'fixed' && row.name.trim() !== '').map((row) => [row.name.trim(), row.value.trim()]),
+  )
+  const sources = Object.fromEntries(
+    rows.filter((row) => row.source !== 'fixed' && row.name.trim() !== '').map((row) => [row.name.trim(), row.source]),
+  ) as HeaderSources
+  return headerSpecSignature(headers, sources)
+}
+
+function HeadersEditor(props: {
+  editorKey: string
+  headers: Record<string, string> | undefined
+  sources: HeaderSources | undefined
+  disabled: boolean
+  t: (k: keyof typeof en) => string
+  onChange: (headers: Record<string, string> | undefined, sources: HeaderSources | undefined) => void
+  onValidityChange?: (valid: boolean) => void
+}) {
+  const { editorKey, headers, sources, disabled, t, onChange, onValidityChange } = props
+  const external = headerSpecSignature(headers, sources)
+  const [rows, setRows] = useState<HeaderEditorRow[]>(() => headersToRows(headers, sources))
+  const [lastKey, setLastKey] = useState(editorKey)
+  // External updates replace a clean draft, but never pending typing.
+  const [committed, setCommitted] = useState(external)
+  if (editorKey !== lastKey) {
+    setLastKey(editorKey)
+    setCommitted(external)
+    setRows(headersToRows(headers, sources))
+  } else if (external !== committed && rowsSpecSignature(rows) === committed) {
+    setCommitted(external)
+    setRows(headersToRows(headers, sources))
+  }
+
+  const commit = (next: HeaderEditorRow[]): void => {
+    setRows(next)
+    const parsed = parseHeaderRows(next)
+    if (parsed.error) {
+      onValidityChange?.(false)
+      return
+    }
+    setCommitted(headerSpecSignature(parsed.headers, parsed.sources))
+    onValidityChange?.(true)
+    onChange(parsed.headers, parsed.sources)
+  }
+
+  const liveError = parseHeaderRows(rows).error
+  const hasSessionPreset = rows.some((r) => r.name.trim().toLowerCase() === 'x-opencode-session')
+  const patchRow = (key: string, patch: Partial<HeaderEditorRow>): void => {
+    commit(rows.map((r) => (r.key === key ? { ...r, ...patch } : r)))
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      {rows.map((r) => (
+        <div key={r.key} style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <input
+            value={r.name}
+            placeholder={t('headersName')}
+            onChange={(e) => patchRow(r.key, { name: e.target.value })}
+            className="mp_input"
+            style={{ flex: '0 1 180px', minWidth: 0 }}
+            disabled={disabled}
+            spellCheck={false}
+          />
+          <select
+            value={r.source}
+            onChange={(e) => {
+              const source = e.target.value as HeaderValueSource
+              patchRow(r.key, source === 'fixed' ? { source } : { source, value: '' })
+            }}
+            className="mp_select"
+            style={{ flex: '0 0 150px' }}
+            disabled={disabled}
+            aria-label={t('headerSource')}
+          >
+            <option value="fixed">{t('headerSourceFixed')}</option>
+            <option value="sessionId">{t('headerSourceSession')}</option>
+            <option value="provider">{t('headerSourceProvider')}</option>
+            <option value="model">{t('headerSourceModel')}</option>
+            <option value="purpose">{t('headerSourcePurpose')}</option>
+          </select>
+          <input
+            value={r.value}
+            placeholder={r.source === 'fixed' ? t('headersValue') : t('headerValueDynamic')}
+            onChange={(e) => patchRow(r.key, { value: e.target.value })}
+            className="mp_input"
+            style={{ flex: '1 1 auto', minWidth: 0 }}
+            disabled={disabled || r.source !== 'fixed'}
+            spellCheck={false}
+          />
+          <button
+            type="button"
+            onClick={() => commit(rows.filter((x) => x.key !== r.key))}
+            disabled={disabled}
+            className="mp_btnSecondary"
+            title={t('delete')}
+            style={{ flex: '0 0 auto' }}
+          >
+            ✕
+          </button>
+        </div>
+      ))}
+      {liveError !== undefined
+        ? <span style={{ color: 'var(--dsw-alias-state-error-primary)', fontSize: 11 }}>{liveError}</span>
+        : <span style={{ fontSize: 11, opacity: 0.6, color: 'var(--dsw-alias-label-tertiary)' }}>{t('headersHint')}</span>}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button
+          type="button"
+          onClick={() => commit([...rows, { key: makeRuleId(), name: '', value: '', source: 'fixed' }])}
+          disabled={disabled}
+          className="mp_btnSecondary"
+        >
+          {t('headersAdd')}
+        </button>
+        {!hasSessionPreset && (
+          <button
+            type="button"
+            onClick={() => commit([...rows, { key: makeRuleId(), name: 'x-opencode-session', value: '', source: 'sessionId' }])}
+            disabled={disabled}
+            className="mp_btnSecondary"
+          >
+            {t('headersPreset')}
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
 
 /** One provider row with the two signals driving dropdown visibility. */
 type ProviderRow = {
@@ -347,10 +581,8 @@ function isProviderRowVisible(r: ProviderRow): boolean {
   return r.active || r.configured === true
 }
 
-/**
- * Normalize catalog providers (mirror fallback included) into wire-order
- * rows. `grouped` reports whether the configured enrichment is known.
- */
+/** Normalize catalog providers into display rows. */
+
 function collectProviderRows(
   providers: CatalogProvider[],
   mirror: DirectoryMirror | undefined,
@@ -385,15 +617,8 @@ function toFieldGroup(label: string, rows: ProviderRow[]): FieldGroup[] {
   return rows.length > 0 ? [{ label, options: rows.map((r) => r.option) }] : []
 }
 
-/**
- * Derive the dropdown groups in one pass. Rows that are neither live nor
- * explicitly configured hide by default — exactly the rows carrying the
- * dormant suffix. Either signal keeps a row visible: live routes work right
- * now, configured rows belong to the user. Hiding degrades to show-all when
- * it would empty the list. A selected-but-hidden value always renders, so
- * the select never drops back to the placeholder and reads as a lost
- * choice. Custom… covers anything not listed at all.
- */
+/** Keep live/configured providers visible; Custom… covers other values. */
+
 function resolveProviderGroups(
   rows: ProviderRow[],
   grouped: boolean,
@@ -420,18 +645,21 @@ type CreatorState = {
   provider: string
   checked: string[]
   customPattern: string
-  proxyUrl: string
+  proxyHostId: string
   purpose: string
-  credentialRef: string
+  /** Header source choices shared by the batch. */
+  headerValueSources: Record<string, HeaderValueSource> | undefined
+  headers: Record<string, string> | undefined
 }
 
 const EMPTY_CREATOR: CreatorState = {
   provider: '',
   checked: [],
   customPattern: '',
-  proxyUrl: '',
+  proxyHostId: DIRECT_PROXY_SENTINEL,
   purpose: '',
-  credentialRef: '',
+  headerValueSources: undefined,
+  headers: undefined,
 }
 
 function validateUrl(urlStr: string): string | undefined {
@@ -463,12 +691,33 @@ function validateRule(r: ProxyRule, all: ProxyRule[]): string | undefined {
   if (!isBareWildcard && starCount > 0 && !(starCount === 1 && r.model.endsWith('*'))) {
     return 'at most one trailing * (e.g. "vendor-*")'
   }
-  if (r.proxyUrl !== '') {
+  if (r.proxyUrl !== undefined && r.proxyUrl !== '') {
     const err = validateUrl(r.proxyUrl)
     if (err) return err
   }
+  if (r.proxyHostId !== undefined && r.proxyHostId !== '' && r.proxyUrl !== undefined && r.proxyUrl !== '') {
+    return 'host reference and legacy proxy URL cannot both be set'
+  }
+  const headerError = parseHeaderRows(headersToRows(r.headers, r.headerValueSources)).error
+  if (headerError) return headerError
   const dup = all.filter(x => x.provider === r.provider && x.model === r.model).length > 1
   if (dup) return 'duplicate'
+  return undefined
+}
+
+/** Mirrors host assertServiceable for a reusable proxy host. */
+export function validateProxyHost(host: ProxyHost): string | undefined {
+  if (!host.id.trim() || host.id !== host.id.trim()) return 'host id required'
+  if (host.id === DIRECT_PROXY_SENTINEL || host.id === CUSTOM_SENTINEL) return 'host id is reserved'
+  if (!host.name.trim() || host.name !== host.name.trim()) return 'host name required'
+  if (!host.proxyUrl.trim()) return 'proxy URL required'
+  const err = validateUrl(host.proxyUrl.trim())
+  if (err) return err
+  if (host.credentialRef !== undefined && host.credentialRef !== '') {
+    if (host.credentialRef !== host.credentialRef.trim()) return 'whitespace around credential ref'
+    if (/\s/.test(host.credentialRef)) return 'whitespace in credential ref'
+    if (host.credentialRef.includes('://')) return 'credential ref is not a URL'
+  }
   return undefined
 }
 
@@ -478,12 +727,8 @@ export function validateDefaultProxy(defaultProxy: string): string | undefined {
   return validateUrl(defaultProxy)
 }
 
-/**
- * Header of one provider group: identity, shared-fields bulk actions, and a
- * two-step destructive delete. The proxy input applies to every member rule;
- * matching semantics are untouched because cross-provider reordering never
- * influences resolution.
- */
+/** Provider group header with bulk host, enable, and delete actions. */
+
 function GroupHeader(props: {
   provider: string
   displayName: string
@@ -491,13 +736,13 @@ function GroupHeader(props: {
   allEnabled: boolean
   disabled: boolean
   t: (k: keyof typeof en) => string
-  proxySuggestions: readonly string[]
-  onApplyProxy(url: string): void
+  hosts: readonly ProxyHost[]
+  hostValue: string | undefined
+  onApplyHost(value: string): void
   onSetEnabled(enabled: boolean): void
   onDelete(): void
 }) {
-  const { provider, displayName, count, allEnabled, disabled, t, proxySuggestions, onApplyProxy, onSetEnabled, onDelete } = props
-  const [proxy, setProxy] = useState('')
+  const { provider, displayName, count, allEnabled, disabled, t, hosts, hostValue, onApplyHost, onSetEnabled, onDelete } = props
   const [confirming, setConfirming] = useState(false)
 
   useEffect(() => {
@@ -513,20 +758,15 @@ function GroupHeader(props: {
         <span style={{ fontWeight: 400, opacity: 0.6, marginLeft: 6 }}>{count}</span>
       </span>
       <span style={{ flex: 1 }} />
-      <ProxyUrlInput
-        value={proxy}
-        onChange={setProxy}
-        placeholder={t('groupApplyProxy')}
-        disabled={disabled}
-        ghostHint={t('proxyGhostHint')}
-        suggestions={proxySuggestions}
-        wrapStyle={{ width: 220, flex: 'none' }}
-        onEnter={(v) => onApplyProxy(v)}
-      />
-      <button type="button" onClick={() => onApplyProxy(proxy.trim())} disabled={disabled || proxy.trim() === ''}
-        className="mp_btnSecondary">
-        {t('groupApply')}
-      </button>
+      <div style={{ width: 240, flex: 'none' }}>
+        <HostSelect
+          value={hostValue}
+          hosts={hosts}
+          onChange={onApplyHost}
+          disabled={disabled}
+          t={t}
+        />
+      </div>
       <button type="button" onClick={() => onSetEnabled(!allEnabled)} disabled={disabled} className="mp_btnSecondary">
         {allEnabled ? t('groupDisableAll') : t('groupEnableAll')}
       </button>
@@ -553,15 +793,6 @@ function GroupHeader(props: {
   )
 }
 
-const smallButtonStyle: CSSProperties = {
-  padding: '4px 8px',
-  borderRadius: 6,
-  border: '1px solid #ddd',
-  background: '#fff',
-  cursor: 'pointer',
-  lineHeight: 1,
-}
-
 export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
   const t = tProp ?? ((k: keyof typeof en) => en[k])
   const snap = useSyncExternalStore(
@@ -576,37 +807,50 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
   )
 
   const cfg: ModelProxyConfig = useMemo(() => {
-    // The host-computed directory mirror rides the same snapshot but is NOT
-    // editable state: strip it before ensureRuleIds/draft/dirty/save so
-    // mirror refreshes never fake a local edit or ride a save.
+    // Strip the host-computed mirror before creating editable state.
     const raw = snap.value ?? {
       enabled: true,
+      proxyHosts: [],
       rules: [],
+      defaultProxyHostId: '',
       defaultProxy: '',
       debug: false,
     }
     const { catalog: _mirror, ...editable } = raw
-    return ensureRuleIds(editable)
+    return ensureRuleIds(normalizeConfig(editable))
   }, [snap.value])
 
-  // Directory mirror fallback for pages without the cross-namespace Typert
-  // remotes. Remote rows always win; mirror rows only fill gaps.
+  // Use the host mirror when remote Typert rows are unavailable.
   const mirror = snap.value?.catalog
   const mirrorModelMap = useMemo(() => mirrorModelsToMap(mirror), [mirror])
 
+  const draftInitialized = useRef(false)
   const [draft, setDraft] = useState<ModelProxyConfig>(cfg)
+  const [invalidHeaderKeys, setInvalidHeaderKeys] = useState<Set<string>>(() => new Set())
+  const [creatorHeadersInvalid, setCreatorHeadersInvalid] = useState(false)
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState<string | undefined>()
 
   const dirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(cfg), [draft, cfg])
+  const hasInvalidHeaders = creatorHeadersInvalid || draft.rules.some((rule) => invalidHeaderKeys.has(rule.id ?? ''))
+  const setHeaderValidity = useCallback((id: string, valid: boolean) => {
+    setInvalidHeaderKeys((previous) => {
+      const next = new Set(previous)
+      const changed = valid ? next.delete(id) : next.add(id)
+      return changed ? next : previous
+    })
+  }, [])
 
-  // Sync remote → draft only while the user has NO local edits. Re-syncing on
-  // every cfg change (e.g. the intermediate snapshots produced while a save's
-  // field writes settle) would clobber in-progress editing mid-save.
+  // Adopt the first non-loading snapshot even if the placeholder differed.
   useEffect(() => {
-    if (!dirty) setDraft(cfg)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cfg])
+    if (snap.status === 'loading') return
+    if (!draftInitialized.current) {
+      draftInitialized.current = true
+      setDraft(cfg)
+    } else if (!dirty) {
+      setDraft(cfg)
+    }
+  }, [cfg, dirty, snap.status])
 
   // Auto-clear "saved" feedback; clear pending timer on unmount/save restart.
   useEffect(() => {
@@ -632,11 +876,7 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
   // in wire order. Dormant routes stay reachable because rules may pre-date
   // their adapter.
   const providerRows = useMemo(() => collectProviderRows(cat.providers, mirror, t), [cat, t, mirror])
-  // Purpose filter options. `GenerateOptions.purpose` is a closed union in
-  // dsh-llm (`'compaction' | 'session-title'`; ordinary chats leave it
-  // unset), so a dropdown replaces hand-typing. Empty string = match all and
-  // is itself a selectable option; Custom… keeps forward-compat with future
-  // purposes and hand-written yaml rules carrying unknown values.
+  // Known purposes use a dropdown; Custom… preserves hand-written values.
   const purposeGroups: FieldGroup[] = useMemo(
     () => [
       {
@@ -672,16 +912,31 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
     Object.keys(cat.modelsByProvider).length === 0 && Object.keys(mirrorModelMap).length === 0
 
   const onSave = useCallback(async () => {
-    // local validation before write — mirror the host's assertServiceable so
-    // rejections surface inline instead of as partial commits
+    if (hasInvalidHeaders) {
+      setMsg(t('invalid'))
+      return
+    }
+    // Validate locally before writing.
+    const hostIds = new Set<string>()
+    for (const host of draft.proxyHosts) {
+      if (validateProxyHost(host) || hostIds.has(host.id)) {
+        setMsg(t('invalid'))
+        return
+      }
+      hostIds.add(host.id)
+    }
     for (const r of draft.rules) {
       const err = validateRule(r, draft.rules)
-      if (err) {
+      if (err || (r.proxyHostId !== undefined && r.proxyHostId !== '' && !hostIds.has(r.proxyHostId))) {
         setMsg(t('invalid'))
         return
       }
     }
-    if (defaultProxyError) {
+    if (
+      defaultProxyError ||
+      (draft.defaultProxyHostId !== undefined && draft.defaultProxyHostId !== '' && !hostIds.has(draft.defaultProxyHostId)) ||
+      (draft.defaultProxyHostId !== undefined && draft.defaultProxyHostId !== '' && draft.defaultProxy !== '')
+    ) {
       setMsg(t('invalid'))
       return
     }
@@ -695,7 +950,7 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
     } finally {
       setSaving(false)
     }
-  }, [draft, controller, t, defaultProxyError])
+  }, [draft, controller, t, defaultProxyError, hasInvalidHeaders])
 
   const setField = useCallback(
     (patch: Partial<ModelProxyConfig>) => setDraft((d) => ({ ...d, ...patch })),
@@ -717,11 +972,11 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
     [providerRows, creator.provider, showUnconfigured, t],
   )
 
-  // Ghost-completion candidates for every proxy URL field: URLs already used
-  // across this draft first, then the built-in presets.
+  // Ghost-completion candidates for reusable host URL fields: configured hosts
+  // first, then built-in presets.
   const proxySuggestions = useMemo(
-    () => mergeProxySuggestions([...draft.rules.map((r) => r.proxyUrl), draft.defaultProxy]),
-    [draft.rules, draft.defaultProxy],
+    () => mergeProxySuggestions([...draft.proxyHosts.map((h) => h.proxyUrl), draft.defaultProxy]),
+    [draft.proxyHosts, draft.defaultProxy],
   )
 
   const setCreatorField = useCallback(
@@ -749,9 +1004,10 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
     const newRules = buildCreatorRules({
       provider: creator.provider,
       models,
-      proxyUrl: creator.proxyUrl,
+      proxyHostId: creator.proxyHostId === DIRECT_PROXY_SENTINEL ? undefined : creator.proxyHostId,
       purpose: creator.purpose,
-      credentialRef: creator.credentialRef,
+      headers: creator.headers,
+      headerValueSources: creator.headerValueSources,
       enabled: true,
     })
     const combined = [...newRules, ...draft.rules]
@@ -764,14 +1020,28 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
     }
     setDraft((d) => ({ ...d, rules: [...newRules, ...d.rules] }))
     setCreator(EMPTY_CREATOR)
+    setCreatorHeadersInvalid(false)
     setCreatorError(undefined)
     setCreatorOpen(false)
   }, [creator, draft.rules, t])
 
-  const applyGroupProxy = useCallback((provider: string, url: string) => {
+  const applyGroupHost = useCallback((provider: string, value: string) => {
     setDraft((d) => ({
       ...d,
-      rules: d.rules.map((r) => (r.provider === provider ? { ...r, proxyUrl: url } : r)),
+      rules: d.rules.map((r) => {
+        if (r.provider !== provider) return r
+        const next = { ...r } as Record<string, unknown>
+        if (value === DIRECT_PROXY_SENTINEL) {
+          delete next.proxyHostId
+          delete next.proxyUrl
+          delete next.credentialRef
+        } else {
+          next.proxyHostId = value
+          delete next.proxyUrl
+          delete next.credentialRef
+        }
+        return next as ProxyRule
+      }),
     }))
   }, [])
 
@@ -785,6 +1055,40 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
   const removeGroup = useCallback((provider: string) => {
     setDraft((d) => ({ ...d, rules: d.rules.filter((r) => r.provider !== provider) }))
   }, [])
+
+  const addHost = useCallback(() => {
+    setDraft((d) => ({
+      ...d,
+      proxyHosts: [...d.proxyHosts, { id: makeProxyHostId(), name: t('newHostName'), proxyUrl: '' }],
+    }))
+  }, [t])
+
+  const updateHost = useCallback((id: string, patch: Partial<ProxyHost>) => {
+    setDraft((d) => ({
+      ...d,
+      proxyHosts: d.proxyHosts.map((host) => (host.id === id ? { ...host, ...patch } : host)),
+    }))
+  }, [])
+
+  const usedHostIds = useMemo(() => {
+    const ids = draft.rules
+      .map((r) => r.proxyHostId)
+      .filter((id): id is string => !!id)
+    if (draft.defaultProxyHostId) ids.push(draft.defaultProxyHostId)
+    return new Set(ids)
+  }, [draft.rules, draft.defaultProxyHostId])
+
+  const removeHost = useCallback((id: string) => {
+    if (usedHostIds.has(id)) {
+      setMsg(t('hostInUse'))
+      return
+    }
+    setDraft((d) => ({
+      ...d,
+      proxyHosts: d.proxyHosts.filter((host) => host.id !== id),
+      ...(d.defaultProxyHostId === id ? { defaultProxyHostId: '' } : {}),
+    }))
+  }, [t, usedHostIds])
 
   const updateRule = useCallback((id: string, patch: Partial<ProxyRule>) => {
     setDraft((d) => ({
@@ -824,7 +1128,12 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
         <div style={{ fontWeight: 600, color: 'var(--dsw-alias-label-primary)' }}>{t('rules')}</div>
         <button
           onClick={() => {
-            setCreatorOpen((o) => !o)
+            const next = !creatorOpen
+            setCreatorOpen(next)
+            if (!next) {
+              setCreator(EMPTY_CREATOR)
+              setCreatorHeadersInvalid(false)
+            }
             setCreatorError(undefined)
           }}
           disabled={!snap.writable}
@@ -874,14 +1183,13 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
               )}
             </div>
             <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('proxyUrl')}</span>
-              <ProxyUrlInput
-                value={creator.proxyUrl}
-                onChange={(v) => setCreatorField({ proxyUrl: v })}
-                placeholder={t('proxyPlaceholder')}
+              <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('proxyHost')}</span>
+              <HostSelect
+                value={creator.proxyHostId}
+                hosts={draft.proxyHosts}
+                onChange={(v) => setCreatorField({ proxyHostId: v })}
                 disabled={!snap.writable}
-                ghostHint={t('proxyGhostHint')}
-                suggestions={proxySuggestions}
+                t={t}
               />
             </label>
           </div>
@@ -892,10 +1200,7 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
               <>
                 <span style={{ opacity: 0.6, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }}>{t('noneCatalogued')}</span>
                 {(() => {
-                  // No catalog rows (e.g. remote faces unreachable and no
-                  // profile declares models): still offer the bare `*`
-                  // wildcard as a one-click checkbox, so "check models" stays
-                  // true and `vendor-*` patterns keep the input below.
+                  // Keep `*` available when the catalog has no models.
                   const starExists = ruleExists(creator.provider, '*')
                   const starChecked = creator.checked.includes('*')
                   return (
@@ -961,16 +1266,19 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
                 inputPlaceholder={t('purposePlaceholder')}
               />
             </label>
-            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('credRef')}</span>
-              <input
-                value={creator.credentialRef}
-                placeholder={t('credRefPlaceholder')}
-                onChange={(e) => setCreatorField({ credentialRef: e.target.value })}
-                className="mp_input"
-                disabled={!snap.writable}
-              />
-            </label>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('headers')}</span>
+            <HeadersEditor
+              editorKey="creator"
+              headers={creator.headers}
+              sources={creator.headerValueSources}
+              disabled={!snap.writable}
+              t={t}
+              onChange={(headers, headerValueSources) => setCreatorField({ headers, headerValueSources })}
+              onValidityChange={setCreatorHeadersInvalid}
+            />
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, alignItems: 'center' }}>
@@ -979,6 +1287,7 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
               onClick={() => {
                 setCreatorOpen(false)
                 setCreator(EMPTY_CREATOR)
+                setCreatorHeadersInvalid(false)
                 setCreatorError(undefined)
               }}
               className="mp_btnSecondary"
@@ -987,9 +1296,9 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
             </button>
             <button
               onClick={createRules}
-              disabled={!snap.writable || creator.provider.trim() === '' || creatorModelCount === 0}
+              disabled={!snap.writable || creatorHeadersInvalid || creator.provider.trim() === '' || creatorModelCount === 0}
               className="mp_btnPrimary"
-              style={{ opacity: (!snap.writable || creator.provider.trim() === '' || creatorModelCount === 0) ? 0.4 : 1 }}
+              style={{ opacity: (!snap.writable || creatorHeadersInvalid || creator.provider.trim() === '' || creatorModelCount === 0) ? 0.4 : 1 }}
             >
               {t('createN').replace('{n}', String(creatorModelCount))}
             </button>
@@ -1012,8 +1321,9 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
               allEnabled={allEnabled}
               disabled={!snap.writable}
               t={t}
-              proxySuggestions={proxySuggestions}
-              onApplyProxy={(url) => applyGroupProxy(group.provider, url)}
+              hosts={draft.proxyHosts}
+              hostValue={group.rules.find((rule) => rule.proxyHostId)?.proxyHostId}
+              onApplyHost={(value) => applyGroupHost(group.provider, value)}
               onSetEnabled={(enabled) => setGroupEnabled(group.provider, enabled)}
               onDelete={() => removeGroup(group.provider)}
             />
@@ -1041,15 +1351,25 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
                       />
                     </label>
                     <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('proxyUrl')}</span>
-                      <ProxyUrlInput
-                        value={r.proxyUrl}
-                        onChange={(v) => updateRule(r.id, { proxyUrl: v })}
-                        placeholder={t('proxyPlaceholder')}
+                      <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('proxyHost')}</span>
+                      <HostSelect
+                        value={r.proxyHostId ?? DIRECT_PROXY_SENTINEL}
+                        hosts={draft.proxyHosts}
+                        onChange={(v) => {
+                          const next = { ...r } as Record<string, unknown>
+                          if (v === DIRECT_PROXY_SENTINEL) {
+                            delete next.proxyHostId
+                            delete next.proxyUrl
+                            delete next.credentialRef
+                          } else {
+                            next.proxyHostId = v
+                            delete next.proxyUrl
+                            delete next.credentialRef
+                          }
+                          updateRule(r.id, next as Partial<ProxyRule>)
+                        }}
                         disabled={!snap.writable}
-                        invalid={err !== undefined}
-                        ghostHint={t('proxyGhostHint')}
-                        suggestions={proxySuggestions}
+                        t={t}
                       />
                       {err && <span style={{ color: 'var(--dsw-alias-state-error-primary)', fontSize: 11 }}>{err === 'duplicate' ? t('duplicate') : err}</span>}
                     </label>
@@ -1066,16 +1386,25 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
                         inputPlaceholder={t('purposePlaceholder')}
                       />
                     </label>
-                    <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('credRef')}</span>
-                      <input
-                        value={r.credentialRef ?? ''}
-                        placeholder={t('credRefPlaceholder')}
-                        onChange={(e) => updateRule(r.id, { credentialRef: e.target.value })}
-                        className="mp_input"
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, gridColumn: '1 / -1' }}>
+                      <span style={{ fontSize: 11, opacity: 0.7, color: 'var(--dsw-alias-label-secondary)' }}>{t('headers')}</span>
+                      <HeadersEditor
+                        editorKey={r.id}
+                        headers={r.headers}
+                        sources={r.headerValueSources}
                         disabled={!snap.writable}
+                        t={t}
+                        onChange={(headers, headerValueSources) => {
+                          const next = { ...r } as Partial<ProxyRule> & Record<string, unknown>
+                          if (headers === undefined) delete (next as Record<string, unknown>).headers
+                          else (next as Record<string, unknown>).headers = headers
+                          if (headerValueSources === undefined) delete (next as Record<string, unknown>).headerValueSources
+                          else (next as Record<string, unknown>).headerValueSources = headerValueSources
+                          updateRule(r.id, next as Partial<ProxyRule>)
+                        }}
+                        onValidityChange={(valid) => setHeaderValidity(r.id, valid)}
                       />
-                    </label>
+                    </div>
                     <label style={{ display: 'flex', gap: 8, alignItems: 'center', color: 'var(--dsw-alias-label-primary)' }}>
                       <input type="checkbox" checked={r.enabled} onChange={(e) => updateRule(r.id, { enabled: e.target.checked })} disabled={!snap.writable} />
                       <span style={{ fontSize: 12 }}>{t('enabledShort')}</span>
@@ -1097,26 +1426,40 @@ export function ModelProxyCard({ controller, catalog, t: tProp }: Props) {
         )
       })}
 
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 4, borderTop: '1px solid var(--dsw-alias-border-l2)' }}>
+        <div>
+          <div style={{ fontWeight: 600, color: 'var(--dsw-alias-label-primary)' }}>{t('proxyHosts')}</div>
+          <div style={{ opacity: 0.65, fontSize: 11, marginTop: 3, color: 'var(--dsw-alias-label-tertiary)' }}>{t('proxyHostsHint')}</div>
+        </div>
+        <ProxyHostsEditor
+          hosts={draft.proxyHosts}
+          usedHostIds={usedHostIds}
+          suggestions={proxySuggestions}
+          disabled={!snap.writable}
+          t={t}
+          onAdd={addHost}
+          onChange={updateHost}
+          onRemove={removeHost}
+        />
+      </div>
+
       <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
         <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' }}>{t('defaultProxy')}</span>
-        <ProxyUrlInput
-          value={draft.defaultProxy}
-          onChange={(v) => setField({ defaultProxy: v })}
-          placeholder={t('defaultPlaceholder')}
+        <HostSelect
+          value={draft.defaultProxyHostId ?? DIRECT_PROXY_SENTINEL}
+          hosts={draft.proxyHosts}
+          onChange={(v) => setField({ defaultProxyHostId: v === DIRECT_PROXY_SENTINEL ? '' : v, defaultProxy: '' })}
           disabled={!snap.writable}
-          invalid={defaultProxyError !== undefined}
-          ghostHint={t('proxyGhostHint')}
-          suggestions={proxySuggestions}
+          t={t}
         />
-        {defaultProxyError && <span style={{ color: 'var(--dsw-alias-state-error-primary)', fontSize: 11 }}>{defaultProxyError}</span>}
       </label>
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
         <button
           onClick={onSave}
-          disabled={!snap.writable || !dirty || saving}
+          disabled={!snap.writable || !dirty || saving || hasInvalidHeaders}
           className="mp_btnPrimary"
-          style={{ opacity: (!snap.writable || !dirty || saving) ? 0.4 : 1 }}
+          style={{ opacity: (!snap.writable || !dirty || saving || hasInvalidHeaders) ? 0.4 : 1 }}
         >
           {saving ? t('saving') : t('save')}
         </button>

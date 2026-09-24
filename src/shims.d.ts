@@ -3,7 +3,7 @@ declare module '@deepseek-ai/cordis' {
   export const Service: any
 }
 declare module '@deepseek-ai/dsh-llm' {
-  export type GenerateOptions = { provider: string; model: string; [k: string]: any }
+  export type GenerateOptions = { provider: string; model: string; sessionId?: string; [k: string]: any }
 }
 declare module '@deepseek-ai/dsh-invariants' {
   export type InvariantInstaller = () => void
@@ -14,6 +14,7 @@ declare module '@deepseek-ai/schemastery' {
     string: () => any
     boolean: () => any
     array: (t: any) => any
+    dict: (t: any) => any
   }
   export default z
 }
@@ -35,7 +36,7 @@ declare module '@deepseek-ai/dsh-client-runtime/client' {
   export type SettingsScope<T> = {
     getSnapshot(): any
     subscribe(cb: () => void): () => void
-    set(field: string, value: any): Promise<void>
+    set(field: string, value: any): Promise<void | boolean>
   }
 }
 declare module '@deepseek-ai/dsh-client-ui-settings-plugins/client' {}

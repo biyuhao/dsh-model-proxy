@@ -153,9 +153,7 @@ export function getOrCreateDispatcher(proxyUrl: string): unknown {
   try {
     u = new URL(proxyUrl)
   } catch {
-    // Unparseable input: echo only a truncated prefix so a mistyped credential
-    // cannot land whole in logs, while still being recognizable to its author.
-    throw new Error(`invalid proxyUrl: ${JSON.stringify(proxyUrl.slice(0, 32))}…(truncated)`)
+    throw new Error('invalid proxyUrl')
   }
 
   let d: unknown
